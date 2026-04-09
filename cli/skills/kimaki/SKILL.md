@@ -11,6 +11,16 @@ version: 1.0.0
 
 You are running in **Kimaki** — a Discord-based AI development environment.
 
+## Permissions
+
+Only users with these Discord permissions can send messages to the bot:
+- Server Owner
+- Administrator permission
+- Manage Server permission
+- "Kimaki" role (case-insensitive)
+
+Other Discord bots are ignored by default. To allow another bot to trigger sessions (for multi-agent orchestration), assign it the "Kimaki" role.
+
 ## CLI Commands
 
 All kimaki CLI commands can be run from anywhere in the repo. These are the primary way to interact with kimaki.

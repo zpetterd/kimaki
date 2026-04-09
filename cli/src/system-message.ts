@@ -263,16 +263,6 @@ Your current OpenCode session ID is: ${sessionId}${channelId ? `\nYour current D
 
 Per-turn Discord metadata like current user and current agent is delivered in synthetic user message parts. Worktree reminders are emitted only when a worktree changes.
 
-## permissions
-
-Only users with these Discord permissions can send messages to the bot:
-- Server Owner
-- Administrator permission
-- Manage Server permission
-- "Kimaki" role (case-insensitive)
-
-Other Discord bots are ignored by default. To allow another bot to trigger sessions (for multi-agent orchestration), assign it the "Kimaki" role.
-
 Use \`kimaki\` CLI commands to interact with kimaki features. See the kimaki skill for complete documentation on CLI usage, worktrees, sessions, tunnels, and task management.
 
 ${topicContext}
