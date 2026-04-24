@@ -1,12 +1,13 @@
 #!/usr/bin/env tsx
 /**
- * Sync skills from remote repos into cli/skills/.
+ * Sync skills from remote repos into the repository root skills/ folder and the
+ * packaged cli/skills/ copy.
  *
  * Reimplements the core discovery logic from the `skills` npm CLI
  * (vercel-labs/skills) without depending on it. The flow is:
  *   1. Shallow-clone each source repo to ./tmp/
  *   2. Recursively walk for SKILL.md files, parse frontmatter
- *   3. Copy discovered skill directories into cli/skills/<name>/
+ *   3. Copy discovered skill directories into skills/<name>/ and cli/skills/<name>/
  *   4. Clean up temp dirs
  *
  * Usage:  pnpm sync-skills          (from cli/ or root)
@@ -15,10 +16,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { promisify } from 'node:util'
-import { exec } from 'node:child_process'
-
-const execAsync = promisify(exec)
+import { execAsync } from '../src/exec-async.js'
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 // Each entry is a GitHub URL. Subpath after /tree/branch/ narrows the search.
@@ -34,7 +32,9 @@ const SKILL_SOURCES: string[] = [
   'https://github.com/remorses/spiceflow',
   'https://github.com/remorses/lintcn',
   'https://github.com/remorses/usecomputer',
-  'https://github.com/remorses/gitchamber',
+  // 'https://github.com/remorses/gitchamber',
+  'https://github.com/remorses/profano',
+  'https://github.com/remorses/sigillo',
 ]
 
 // Directories to skip during recursive SKILL.md search
@@ -216,7 +216,30 @@ async function cloneRepo(
   const refArgs = parsed.ref ? `--branch ${parsed.ref}` : ''
   const cmd = `git clone --depth 1 ${refArgs} ${parsed.url} ${targetDir}`
 
-  await execAsync(cmd, { timeout: 60_000 })
+  const maxAttempts = 3
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await execAsync(cmd, { timeout: 60_000 })
+      return targetDir
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        throw error
+      }
+
+      if (fs.existsSync(targetDir)) {
+        fs.rmSync(targetDir, { recursive: true, force: true })
+      }
+
+      const retryDelayMs = attempt * 1_000
+      console.log(
+        `    clone attempt ${attempt} failed, retrying in ${retryDelayMs}ms...`,
+      )
+      await new Promise((resolve) => {
+        setTimeout(resolve, retryDelayMs)
+      })
+    }
+  }
+
   return targetDir
 }
 
@@ -254,15 +277,18 @@ async function copySkill(skill: SkillInfo, outputDir: string): Promise<string> {
 
 async function main() {
   const scriptDir = path.dirname(new URL(import.meta.url).pathname)
-  const discordDir = path.resolve(scriptDir, '..')
-  const outputDir = path.join(discordDir, 'skills')
-  const tmpDir = path.join(discordDir, '..', 'tmp')
+  const cliDir = path.resolve(scriptDir, '..')
+  const repoRootDir = path.resolve(cliDir, '..')
+  const rootSkillsDir = path.join(repoRootDir, 'skills')
+  const cliSkillsDir = path.join(cliDir, 'skills')
+  const tmpDir = path.join(repoRootDir, 'tmp')
 
   // Ensure output and tmp dirs exist
-  fs.mkdirSync(outputDir, { recursive: true })
+  fs.mkdirSync(rootSkillsDir, { recursive: true })
+  fs.mkdirSync(cliSkillsDir, { recursive: true })
   fs.mkdirSync(tmpDir, { recursive: true })
 
-  console.log(`Syncing skills to ${outputDir}\n`)
+  console.log(`Syncing skills to ${rootSkillsDir} and ${cliSkillsDir}\n`)
 
   let totalSynced = 0
 
@@ -288,9 +314,10 @@ async function main() {
       console.log(`    found ${skills.length} skill(s):`)
 
       for (const skill of skills) {
-        const dest = await copySkill(skill, outputDir)
+        const rootDest = await copySkill(skill, rootSkillsDir)
+        const cliDest = await copySkill(skill, cliSkillsDir)
         console.log(
-          `      - ${skill.name} -> ${path.relative(discordDir, dest)}`,
+          `      - ${skill.name} -> ${path.relative(repoRootDir, rootDest)} | ${path.relative(repoRootDir, cliDest)}`,
         )
         totalSynced++
       }

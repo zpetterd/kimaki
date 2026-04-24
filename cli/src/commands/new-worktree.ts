@@ -17,6 +17,7 @@ import {
   setWorktreeError,
   getChannelDirectory,
   getThreadWorktree,
+  getThreadSession,
 } from '../database.js'
 import {
   SILENT_MESSAGE_FLAGS,
@@ -31,11 +32,36 @@ import {
   listBranchesByLastCommit,
   validateBranchRef,
 } from '../worktrees.js'
+import {
+  buildExternalDirectoryPermissionRules,
+  getOpencodeClient,
+  initializeOpencodeForDirectory,
+} from '../opencode.js'
 import { WORKTREE_PREFIX } from './merge-worktree.js'
 import type { AutocompleteContext } from './types.js'
 import * as errore from 'errore'
 
 const logger = createLogger(LogPrefix.WORKTREE)
+const DEFAULT_WORKTREE_BASE_REF = 'HEAD'
+
+async function resolveRequestedWorktreeBaseRef({
+  projectDirectory,
+  rawBaseBranch,
+}: {
+  projectDirectory: string
+  rawBaseBranch?: string
+}): Promise<string | Error> {
+  if (!rawBaseBranch) {
+    // Default to the current local HEAD so worktrees can branch from
+    // unpublished commits in the main checkout.
+    return DEFAULT_WORKTREE_BASE_REF
+  }
+
+  return validateBranchRef({
+    directory: projectDirectory,
+    ref: rawBaseBranch,
+  })
+}
 
 /** Status message shown while a worktree is being created. */
 export function worktreeCreatingMessage(worktreeName: string): string {
@@ -43,33 +69,89 @@ export function worktreeCreatingMessage(worktreeName: string): string {
 }
 
 class WorktreeError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
+  constructor(message: string, options?: ErrorOptions) {
     super(message, options)
     this.name = 'WorktreeError'
   }
 }
 
 /**
- * Format worktree name: lowercase, spaces to dashes, remove special chars, add opencode/kimaki- prefix.
- * "My Feature" → "opencode/kimaki-my-feature"
- * Returns empty string if no valid name can be extracted.
+ * Lowercase, collapse whitespace to dashes, drop non-[a-z0-9-] chars.
+ * Does NOT add the `opencode/kimaki-` prefix — callers do that so they can
+ * optionally compress the slug first for auto-derived names.
  */
-export function formatWorktreeName(name: string): string {
-  const formatted = name
+export function slugifyWorktreeName(name: string): string {
+  return name
     .toLowerCase()
     .trim()
     .replace(/\s+/g, '-')
     .replace(/[^a-z0-9-]/g, '')
+}
 
-  if (!formatted) {
+/**
+ * Compress a slug by stripping vowels from each dash-separated word, but
+ * keeping the first character so the word stays recognizable.
+ * Only applied to slugs longer than 20 chars — short names are left alone.
+ *
+ * "configurable-sidebar-width-by-component" → "cnfgrbl-sdbr-wdth-by-cmpnnt"
+ *
+ * Used ONLY for auto-derived worktree names (thread name, prompt slug)
+ * so long Discord titles don't produce 80-char folder paths that make
+ * the agent lazy and reuse the previous worktree. User-provided names
+ * via `--worktree <name>` or `/new-worktree name:` are never compressed.
+ */
+export function shortenWorktreeSlug(slug: string): string {
+  if (slug.length <= 20) {
+    return slug
+  }
+  const shortened = slug
+    .split('-')
+    .map((word) => {
+      if (!word) {
+        return word
+      }
+      const first = word[0]
+      const rest = word.slice(1).replace(/[aeiou]/g, '')
+      return first + rest
+    })
+    .join('-')
+  return shortened || slug
+}
+
+/**
+ * Format worktree name: lowercase, spaces to dashes, remove special chars, add opencode/kimaki- prefix.
+ * "My Feature" → "opencode/kimaki-my-feature"
+ * Returns empty string if no valid name can be extracted.
+ *
+ * This is the "explicit" path used when the user provides a specific name.
+ * The slug is NOT compressed — if you ask for `my-long-explicit-branch-name`
+ * you get `opencode/kimaki-my-long-explicit-branch-name` verbatim.
+ */
+export function formatWorktreeName(name: string): string {
+  const slug = slugifyWorktreeName(name)
+  if (!slug) {
     return ''
   }
-  return `opencode/kimaki-${formatted}`
+  return `opencode/kimaki-${slug}`
+}
+
+/**
+ * Format an auto-derived worktree name (from a Discord thread title or a
+ * prompt). Same as formatWorktreeName but compresses slugs longer than 20
+ * chars by stripping vowels so the on-disk folder name stays short.
+ */
+export function formatAutoWorktreeName(name: string): string {
+  const slug = slugifyWorktreeName(name)
+  if (!slug) {
+    return ''
+  }
+  return `opencode/kimaki-${shortenWorktreeSlug(slug)}`
 }
 
 /**
  * Derive worktree name from thread name.
  * Handles existing "⬦ worktree: opencode/kimaki-name" format or uses thread name directly.
+ * Uses formatAutoWorktreeName so long thread titles get vowel-compressed.
  */
 function deriveWorktreeNameFromThread(threadName: string): string {
   // Handle existing "⬦ worktree: opencode/kimaki-name" format
@@ -80,10 +162,10 @@ function deriveWorktreeNameFromThread(threadName: string): string {
     if (extractedName.startsWith('opencode/kimaki-')) {
       return extractedName
     }
-    return formatWorktreeName(extractedName)
+    return formatAutoWorktreeName(extractedName)
   }
-  // Use thread name directly
-  return formatWorktreeName(threadName)
+  // Use thread name directly (compressed if > 20 chars)
+  return formatAutoWorktreeName(threadName)
 }
 
 /**
@@ -183,6 +265,11 @@ export async function createWorktreeInBackground({
         worktreeDirectory: worktreeResult.directory,
       })
 
+      await denyPreviousCheckoutForExistingSession({
+        threadId: thread.id,
+        projectDirectory,
+      })
+
       // React with tree emoji to mark as worktree thread
       await reactToThread({
         rest,
@@ -205,6 +292,61 @@ export async function createWorktreeInBackground({
       return new Error(`Worktree creation failed: ${e instanceof Error ? e.message : String(e)}`, { cause: e })
     },
   })
+}
+
+async function denyPreviousCheckoutForExistingSession({
+  threadId,
+  projectDirectory,
+}: {
+  threadId: string
+  projectDirectory: string
+}): Promise<void> {
+  const sessionId = await getThreadSession(threadId)
+  if (!sessionId) {
+    return
+  }
+
+  const initializeResult = await initializeOpencodeForDirectory(projectDirectory)
+  if (initializeResult instanceof Error) {
+    logger.warn(
+      `[WORKTREE] Failed to initialize OpenCode before denying previous checkout for thread ${threadId}: ${initializeResult.message}`,
+    )
+    return
+  }
+
+  const client = getOpencodeClient(projectDirectory)
+  if (!client) {
+    logger.warn(
+      `[WORKTREE] Missing OpenCode client for previous checkout deny update in thread ${threadId}`,
+    )
+    return
+  }
+
+  const updateResult = await errore.tryAsync({
+    try: async () => {
+      await client.session.update({
+        sessionID: sessionId,
+        permission: buildExternalDirectoryPermissionRules({
+          resolvedPattern: projectDirectory.replaceAll('\\', '/'),
+          action: 'deny',
+        }),
+      })
+    },
+    catch: (e) =>
+      new Error('Failed to deny previous checkout for existing session', {
+        cause: e,
+      }),
+  })
+  if (updateResult instanceof Error) {
+    logger.warn(
+      `[WORKTREE] Failed to deny previous checkout for existing session in thread ${threadId}: ${updateResult.message}`,
+    )
+    return
+  }
+
+  logger.log(
+    `[WORKTREE] Denied previous checkout for existing session ${sessionId} in thread ${threadId}`,
+  )
 }
 
 async function findExistingWorktreePath({
@@ -254,15 +396,14 @@ export async function handleNewWorktreeCommand({
     return
   }
 
-  const isThread =
+  // Handle command in existing thread - attach worktree to this thread
+  if (
     channel.type === ChannelType.PublicThread ||
     channel.type === ChannelType.PrivateThread
-
-  // Handle command in existing thread - attach worktree to this thread
-  if (isThread) {
+  ) {
     await handleWorktreeInThread({
       command,
-      thread: channel as ThreadChannel,
+      thread: channel,
     })
     return
   }
@@ -292,7 +433,7 @@ export async function handleNewWorktreeCommand({
     return
   }
 
-  const textChannel = channel as TextChannel
+  const textChannel = channel
 
   const projectDirectory = await getProjectDirectoryFromChannel(
     textChannel,
@@ -302,17 +443,13 @@ export async function handleNewWorktreeCommand({
     return
   }
 
-  let baseBranch = rawBaseBranch
-  if (baseBranch) {
-    const validated = await validateBranchRef({
-      directory: projectDirectory,
-      ref: baseBranch,
-    })
-    if (validated instanceof Error) {
-      await command.editReply(`Invalid base branch: \`${baseBranch}\``)
-      return
-    }
-    baseBranch = validated
+  const baseBranch = await resolveRequestedWorktreeBaseRef({
+    projectDirectory,
+    rawBaseBranch,
+  })
+  if (baseBranch instanceof Error) {
+    await command.editReply(`Invalid base branch: \`${rawBaseBranch}\``)
+    return
   }
 
   const existingWorktree = await findExistingWorktreePath({
@@ -415,24 +552,20 @@ async function handleWorktreeInThread({
   }
 
   const projectDirectory = await getProjectDirectoryFromChannel(
-    parent as TextChannel,
+    parent,
   )
   if (errore.isError(projectDirectory)) {
     await command.editReply(projectDirectory.message)
     return
   }
 
-  let baseBranch = rawBaseBranch
-  if (baseBranch) {
-    const validated = await validateBranchRef({
-      directory: projectDirectory,
-      ref: baseBranch,
-    })
-    if (validated instanceof Error) {
-      await command.editReply(`Invalid base branch: \`${baseBranch}\``)
-      return
-    }
-    baseBranch = validated
+  const baseBranch = await resolveRequestedWorktreeBaseRef({
+    projectDirectory,
+    rawBaseBranch,
+  })
+  if (baseBranch instanceof Error) {
+    await command.editReply(`Invalid base branch: \`${rawBaseBranch}\``)
+    return
   }
 
   const existingWorktreePath = await findExistingWorktreePath({

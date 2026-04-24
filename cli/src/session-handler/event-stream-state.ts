@@ -10,10 +10,26 @@ import type {
 } from '@opencode-ai/sdk/v2'
 import { getOpencodeEventSessionId } from './opencode-session-event-log.js'
 
+type QueueQuestionHandoffStartedEvent = {
+  type: 'queue.question-handoff-started'
+  properties: {
+    sessionID: string
+  }
+}
+
+export type EventBufferEvent = OpenCodeEvent | QueueQuestionHandoffStartedEvent
+
 export type EventBufferEntry = {
-  event: OpenCodeEvent
+  event: EventBufferEvent
   timestamp: number
   eventIndex?: number
+}
+
+export function getEventBufferSessionId(event: EventBufferEvent): string | undefined {
+  if (event.type === 'queue.question-handoff-started') {
+    return event.properties.sessionID
+  }
+  return getOpencodeEventSessionId(event)
 }
 
 type AssistantMessage = Extract<OpenCodeMessage, { role: 'assistant' }>
@@ -45,9 +61,14 @@ function getTaskCandidateFromEvent({
   event,
   mainSessionId,
 }: {
-  event: OpenCodeEvent
+  event: EventBufferEvent
   mainSessionId: string
-}): { assistantMessageId: string; childSessionId: string; subagentType?: string } | undefined {
+}): {
+  assistantMessageId: string
+  childSessionId: string
+  subagentType?: string
+  description?: string
+} | undefined {
   if (event.type !== 'message.part.updated') {
     return undefined
   }
@@ -56,7 +77,7 @@ function getTaskCandidateFromEvent({
   if (part.sessionID !== mainSessionId) {
     return undefined
   }
-  if (part.type !== 'tool' || part.tool !== 'task') {
+  if (part.type !== 'tool' || part.tool !== 'task' || part.state.status === 'pending') {
     return undefined
   }
 
@@ -66,11 +87,20 @@ function getTaskCandidateFromEvent({
   }
 
   const subagentType = part.state.input?.subagent_type
+  const description = part.state.input?.description
   return {
     assistantMessageId: part.messageID,
     childSessionId,
     subagentType: typeof subagentType === 'string' ? subagentType : undefined,
+    description: typeof description === 'string' ? description : undefined,
   }
+}
+
+export type DerivedSubagentSession = {
+  childSessionId: string
+  subagentType?: string
+  description?: string
+  timestamp: number
 }
 
 // Scans backward for most recent session-scoped lifecycle event.
@@ -90,8 +120,8 @@ export function isSessionBusy({
     if (!entry) {
       continue
     }
-    const e = entry.event
-    const eid = getOpencodeEventSessionId(e)
+     const e = entry.event
+     const eid = getEventBufferSessionId(e)
     if (eid !== sessionId) {
       continue
     }
@@ -100,6 +130,36 @@ export function isSessionBusy({
     }
     if (e.type === 'session.status') {
       return e.properties.status.type === 'busy'
+    }
+  }
+  return false
+}
+
+export function didQuestionQueueHandoffSinceLatestQuestionAsked({
+  events,
+  sessionId,
+  upToIndex,
+}: {
+  events: EventBufferEntry[]
+  sessionId: string
+  upToIndex?: number
+}): boolean {
+  const end = upToIndex ?? events.length - 1
+  for (let i = end; i >= 0; i--) {
+    const entry = events[i]
+    if (!entry) {
+      continue
+    }
+    const event = entry.event
+    const eventSessionId = getEventBufferSessionId(event)
+    if (eventSessionId !== sessionId) {
+      continue
+    }
+    if (event.type === 'queue.question-handoff-started') {
+      return true
+    }
+    if (event.type === 'question.asked') {
+      return false
     }
   }
   return false
@@ -605,4 +665,42 @@ export function getDerivedSubtaskAgentType({
     return candidate.subagentType
   }
   return undefined
+}
+
+export function getDerivedSubagentSessions({
+  events,
+  mainSessionId,
+  upToIndex,
+}: {
+  events: EventBufferEntry[]
+  mainSessionId: string
+  upToIndex?: number
+}): DerivedSubagentSession[] {
+  const end = upToIndex ?? events.length - 1
+  const seenChildSessionIds = new Set<string>()
+  const sessions: DerivedSubagentSession[] = []
+
+  for (let i = end; i >= 0; i--) {
+    const entry = events[i]
+    if (!entry) {
+      continue
+    }
+    const candidate = getTaskCandidateFromEvent({
+      event: entry.event,
+      mainSessionId,
+    })
+    if (!candidate || seenChildSessionIds.has(candidate.childSessionId)) {
+      continue
+    }
+
+    seenChildSessionIds.add(candidate.childSessionId)
+    sessions.push({
+      childSessionId: candidate.childSessionId,
+      subagentType: candidate.subagentType,
+      description: candidate.description,
+      timestamp: entry.timestamp,
+    })
+  }
+
+  return sessions
 }

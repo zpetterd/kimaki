@@ -4,9 +4,9 @@
 
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import * as errore from 'errore'
+import { getDataDir } from './config.js'
 import { execAsync } from './exec-async.js'
 import { createLogger, LogPrefix } from './logger.js'
 
@@ -530,24 +530,38 @@ async function resolveDefaultWorktreeTarget(
   return 'HEAD'
 }
 
-function getManagedWorktreeDirectory({
+/**
+ * Build the on-disk directory for a managed worktree.
+ *
+ * Layout: `<kimakiDataDir>/worktrees/<8charProjectHash>/<basename>`
+ *
+ * - Lives under the kimaki data dir instead of the long
+ *   `~/.local/share/opencode/worktree/<40-char-hash>/<name>` path so folder
+ *   names stay short and readable (agents tend to give up and reuse the old
+ *   worktree when paths get absurdly long).
+ * - The 8-char project hash keeps worktrees from different projects that
+ *   happen to share a slug from colliding.
+ * - Strips the `opencode/kimaki-` (or `opencode-kimaki-`) prefix from the
+ *   folder name since it's redundant noise on disk. The git branch name
+ *   itself still uses `opencode/kimaki-<slug>` so merge/cleanup logic is
+ *   unchanged.
+ */
+export function getManagedWorktreeDirectory({
   directory,
   name,
 }: {
   directory: string
   name: string
 }): string {
-  const projectHash = crypto.createHash('sha1').update(directory).digest('hex')
-  const safeName = name.replaceAll('/', '-')
-  return path.join(
-    os.homedir(),
-    '.local',
-    'share',
-    'opencode',
-    'worktree',
-    projectHash,
-    safeName,
-  )
+  const projectHash = crypto
+    .createHash('sha1')
+    .update(directory)
+    .digest('hex')
+    .slice(0, 8)
+  const withoutPrefix = name
+    .replace(/^opencode\/kimaki-/, '')
+    .replaceAll('/', '-')
+  return path.join(getDataDir(), 'worktrees', projectHash, withoutPrefix)
 }
 
 /**
@@ -724,6 +738,8 @@ export async function deleteWorktree({
 }: {
   projectDirectory: string
   worktreeDirectory: string
+  // Branch name to delete after removing the worktree.
+  // Pass empty string for detached HEAD worktrees — branch deletion is skipped.
   worktreeName: string
 }): Promise<void | Error> {
   let removeResult = await git(
@@ -749,24 +765,27 @@ export async function deleteWorktree({
     }
   }
   if (removeResult instanceof Error) {
-    return new Error(`Failed to remove worktree ${worktreeName}`, {
+    return new Error(`Failed to remove worktree ${worktreeName || worktreeDirectory}`, {
       cause: removeResult,
     })
   }
 
-  const deleteBranchResult = await git(
-    projectDirectory,
-    `branch -d ${JSON.stringify(worktreeName)}`,
-  )
-  if (deleteBranchResult instanceof Error) {
-    return new Error(`Failed to delete branch ${worktreeName}`, {
-      cause: deleteBranchResult,
-    })
+  // Skip branch deletion for detached HEAD worktrees (no branch to delete)
+  if (worktreeName) {
+    const deleteBranchResult = await git(
+      projectDirectory,
+      `branch -d ${JSON.stringify(worktreeName)}`,
+    )
+    if (deleteBranchResult instanceof Error) {
+      return new Error(`Failed to delete branch ${worktreeName}`, {
+        cause: deleteBranchResult,
+      })
+    }
   }
 
   const pruneResult = await git(projectDirectory, 'worktree prune')
   if (pruneResult instanceof Error) {
-    logger.warn(`Failed to prune worktrees after deleting ${worktreeName}`)
+    logger.warn(`Failed to prune worktrees after deleting ${worktreeName || worktreeDirectory}`)
   }
 }
 
@@ -1245,4 +1264,106 @@ export async function validateWorktreeDirectory({
   }
 
   return absoluteCandidate
+}
+
+// Parsed entry from `git worktree list --porcelain`.
+// Represents any worktree (kimaki, opencode, manual) visible to git.
+export type GitWorktree = {
+  directory: string
+  branch: string | null // null for detached HEAD
+  head: string
+  detached: boolean
+  locked: boolean
+  prunable: boolean
+}
+
+type PartialGitWorktree = {
+  directory?: string
+  branch?: string | null
+  head?: string
+  detached?: boolean
+  locked?: boolean
+  prunable?: boolean
+}
+
+function flushGitWorktreeEntry(current: PartialGitWorktree): GitWorktree | null {
+  if (!current.directory) {
+    return null
+  }
+  return {
+    directory: current.directory,
+    branch: current.branch ?? null,
+    head: current.head ?? '',
+    detached: current.detached ?? false,
+    locked: current.locked ?? false,
+    prunable: current.prunable ?? false,
+  }
+}
+
+// Parse `git worktree list --porcelain` output into structured entries.
+// Skips the first entry (the main checkout) since that's the project root.
+export function parseGitWorktreeListPorcelain(
+  output: string,
+): GitWorktree[] {
+  const entries: GitWorktree[] = []
+  let current: PartialGitWorktree = {}
+
+  for (const line of output.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      const flushed = flushGitWorktreeEntry(current)
+      if (flushed) {
+        entries.push(flushed)
+      }
+      current = { directory: line.slice('worktree '.length) }
+      continue
+    }
+    if (line.startsWith('HEAD ')) {
+      current.head = line.slice('HEAD '.length)
+      continue
+    }
+    if (line.startsWith('branch ')) {
+      // "branch refs/heads/opencode/kimaki-foo" → "opencode/kimaki-foo"
+      current.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '')
+      continue
+    }
+    if (line === 'detached') {
+      current.detached = true
+      continue
+    }
+    // "locked" or "locked <reason>"
+    if (line === 'locked' || line.startsWith('locked ')) {
+      current.locked = true
+      continue
+    }
+    if (line.startsWith('prunable')) {
+      current.prunable = true
+      continue
+    }
+  }
+  // Flush last entry
+  const flushed = flushGitWorktreeEntry(current)
+  if (flushed) {
+    entries.push(flushed)
+  }
+
+  // Skip the first entry — it's the main checkout (project root)
+  return entries.slice(1)
+}
+
+// List all git worktrees for a project directory (excluding the main checkout).
+// Returns Error on git failure, empty array if no worktrees exist.
+export async function listGitWorktrees({
+  projectDirectory,
+  timeout,
+}: {
+  projectDirectory: string
+  timeout?: number
+}): Promise<GitWorktree[] | Error> {
+  const result = await git(projectDirectory, 'worktree list --porcelain', {
+    timeout,
+  })
+  if (result instanceof Error) {
+    return result
+  }
+  return parseGitWorktreeListPorcelain(result)
 }

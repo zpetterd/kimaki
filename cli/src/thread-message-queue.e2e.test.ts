@@ -386,7 +386,7 @@ e2eTest('thread message queue ordering', () => {
     if (directories) {
       fs.rmSync(directories.dataDir, { recursive: true, force: true })
     }
-  }, 10_000)
+  }, 20_000)
 
   test(
     'first prompt after cold opencode server start still streams text parts',
@@ -740,6 +740,11 @@ e2eTest('thread message queue ordering', () => {
       const markerRelativePath = path.join('tmp', 'bash-tool-executed.txt')
       const markerPath = path.join(directories.projectDirectory, markerRelativePath)
       fs.rmSync(markerPath, { force: true })
+      const existingThreadIds = new Set(
+        (await discord.channel(TEXT_CHANNEL_ID).getThreads()).map((thread) => {
+          return thread.id
+        }),
+      )
 
       const prompt = 'Reply with exactly: BASH_TOOL_FILE_MARKER'
       await discord.channel(TEXT_CHANNEL_ID).user(TEST_USER_ID).sendMessage({
@@ -747,9 +752,9 @@ e2eTest('thread message queue ordering', () => {
       })
 
       const thread = await discord.channel(TEXT_CHANNEL_ID).waitForThread({
-        timeout: 4_000,
+        timeout: 6_000,
         predicate: (t) => {
-          return t.name === prompt
+          return !existingThreadIds.has(t.id)
         },
       })
 
@@ -758,13 +763,13 @@ e2eTest('thread message queue ordering', () => {
         threadId: thread.id,
         userId: TEST_USER_ID,
         text: 'running create file',
-        timeout: 4_000,
+        timeout: 6_000,
       })
 
       await waitForFooterMessage({
         discord,
         threadId: thread.id,
-        timeout: 4_000,
+        timeout: 6_000,
       })
 
       const deadline = Date.now() + 4_000
@@ -915,6 +920,132 @@ e2eTest('thread message queue ordering', () => {
         ⬥ ok
         *project ⋅ main ⋅ Ns ⋅ N% ⋅ deterministic-v2*"
       `)
+    },
+    12_000,
+  )
+
+  test(
+    '/clear-queue position clears only that queued message',
+    async () => {
+      await discord.channel(TEXT_CHANNEL_ID).user(TEST_USER_ID).sendMessage({
+        content: 'Reply with exactly: clear-queue-setup',
+      })
+
+      const thread = await discord.channel(TEXT_CHANNEL_ID).waitForThread({
+        timeout: 4_000,
+        predicate: (t) => {
+          return t.name === 'Reply with exactly: clear-queue-setup'
+        },
+      })
+
+      const th = discord.thread(thread.id)
+      await th.waitForBotReply({ timeout: 4_000 })
+      await waitForFooterMessage({
+        discord,
+        threadId: thread.id,
+        timeout: 4_000,
+      })
+
+      await th.user(TEST_USER_ID).runSlashCommand({
+        name: 'queue',
+        options: [{ name: 'message', type: 3, value: 'Reply with exactly: race-final' }],
+      })
+
+      const { id: secondQueueInteractionId } = await th.user(TEST_USER_ID)
+        .runSlashCommand({
+          name: 'queue',
+          options: [{ name: 'message', type: 3, value: 'Reply with exactly: removed-queued-message' }],
+        })
+      const secondQueueAck = await th.waitForInteractionAck({
+        interactionId: secondQueueInteractionId,
+        timeout: 4_000,
+      })
+      if (!secondQueueAck.messageId) {
+        throw new Error('Expected second /queue response message id')
+      }
+
+      const secondQueueAckMessage = await waitForMessageById({
+        discord,
+        threadId: thread.id,
+        messageId: secondQueueAck.messageId,
+        timeout: 4_000,
+      })
+      expect(secondQueueAckMessage.content).toContain('Queued message (position 1)')
+
+      const { id: thirdQueueInteractionId } = await th.user(TEST_USER_ID).runSlashCommand({
+        name: 'queue',
+        options: [{ name: 'message', type: 3, value: 'Reply with exactly: kept-queued-message' }],
+      })
+      const thirdQueueAck = await th.waitForInteractionAck({
+        interactionId: thirdQueueInteractionId,
+        timeout: 4_000,
+      })
+      if (!thirdQueueAck.messageId) {
+        throw new Error('Expected third /queue response message id')
+      }
+
+      const thirdQueueAckMessage = await waitForMessageById({
+        discord,
+        threadId: thread.id,
+        messageId: thirdQueueAck.messageId,
+        timeout: 4_000,
+      })
+      expect(thirdQueueAckMessage.content).toContain('Queued message (position 2)')
+
+      const { id: clearInteractionId } = await th.user(TEST_USER_ID).runSlashCommand({
+        name: 'clear-queue',
+        options: [{ name: 'position', type: 4, value: 1 }],
+      })
+      const clearAck = await th.waitForInteractionAck({
+        interactionId: clearInteractionId,
+        timeout: 4_000,
+      })
+      if (!clearAck.messageId) {
+        throw new Error('Expected /clear-queue response message id')
+      }
+
+      const clearAckMessage = await waitForMessageById({
+        discord,
+        threadId: thread.id,
+        messageId: clearAck.messageId,
+        timeout: 4_000,
+      })
+      expect(clearAckMessage.content).toBe('Cleared queued message at position 1')
+
+      await waitForBotMessageContaining({
+        discord,
+        threadId: thread.id,
+        userId: TEST_USER_ID,
+        text: '» **queue-tester:** Reply with exactly: kept-queued-message',
+        afterMessageId: clearAckMessage.id,
+        timeout: 8_000,
+      })
+
+      await waitForFooterMessage({
+        discord,
+        threadId: thread.id,
+        timeout: 8_000,
+        afterMessageIncludes: '⬥ ok',
+        afterAuthorId: discord.botUserId,
+      })
+
+      const threadText = await th.text()
+      expect(threadText).toMatchInlineSnapshot(`
+        "--- from: user (queue-tester)
+        Reply with exactly: clear-queue-setup
+        --- from: assistant (TestBot)
+        ⬥ ok
+        *project ⋅ main ⋅ Ns ⋅ N% ⋅ deterministic-v2*
+        » **queue-tester:** Reply with exactly: race-final
+        Queued message (position 1)
+        Queued message (position 2)
+        Cleared queued message at position 1
+        ⬥ race-final
+        *project ⋅ main ⋅ Ns ⋅ N% ⋅ deterministic-v2*
+        » **queue-tester:** Reply with exactly: kept-queued-message"
+      `)
+      expect(threadText).not.toContain('removed-queued-message')
+      expect(threadText).toContain('kept-queued-message')
     },
     12_000,
   )

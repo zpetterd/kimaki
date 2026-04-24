@@ -91,6 +91,7 @@ import {
 } from './opencode-session-event-log.js'
 import {
   doesLatestUserTurnHaveNaturalCompletion,
+  didQuestionQueueHandoffSinceLatestQuestionAsked,
   getAssistantMessageIdsForLatestUserTurn,
   getCurrentTurnStartTime,
   isSessionBusy,
@@ -101,6 +102,7 @@ import {
   hasAssistantMessageCompletedBefore,
   isAssistantMessageInLatestUserTurn,
   isAssistantMessageNaturalCompletion,
+  type EventBufferEvent,
   type EventBufferEntry,
 } from './event-stream-state.js'
 
@@ -404,11 +406,14 @@ export function isEssentialToolPart(part: Part): boolean {
 const DISCORD_THREAD_NAME_MAX = 100
 const WORKTREE_THREAD_PREFIX = '⬦ '
 
-// Pure derivation: given an OpenCode session title and the current thread name,
-// return the new thread name to apply, or undefined when no rename is needed.
-// - Skips placeholder titles ("New Session - ...") to match external-sync.
-// - Preserves worktree prefix when the current name carries it.
-// - Returns undefined when the candidate matches currentName already.
+// Prefixes that should survive OpenCode session title renames.
+// When a thread starts with one of these, the rename preserves it.
+const PRESERVED_THREAD_PREFIXES: string[] = [
+  WORKTREE_THREAD_PREFIX,
+  'btw: ',
+  'Fork: ',
+]
+
 export function deriveThreadNameFromSessionTitle({
   sessionTitle,
   currentName,
@@ -423,9 +428,11 @@ export function deriveThreadNameFromSessionTitle({
   if (/^new session\s*-/i.test(trimmed)) {
     return undefined
   }
-  const hasWorktreePrefix = currentName.startsWith(WORKTREE_THREAD_PREFIX)
-  const prefix = hasWorktreePrefix ? WORKTREE_THREAD_PREFIX : ''
-  const candidate = `${prefix}${trimmed}`.slice(0, DISCORD_THREAD_NAME_MAX)
+  const matchedPrefix =
+    PRESERVED_THREAD_PREFIXES.find((p) => {
+      return currentName.startsWith(p)
+    }) ?? ''
+  const candidate = `${matchedPrefix}${trimmed}`.slice(0, DISCORD_THREAD_NAME_MAX)
   if (candidate === currentName) {
     return undefined
   }
@@ -773,7 +780,7 @@ export class ThreadSessionRuntime {
     const hydratedEvents: EventBufferEntry[] = rows.flatMap((row) => {
       const eventResult = errore.try({
         try: () => {
-          return JSON.parse(row.event_json) as OpenCodeEvent
+          return JSON.parse(row.event_json) as EventBufferEvent
         },
         catch: (error) => {
           return new Error('Failed to parse persisted session event JSON', {
@@ -813,7 +820,9 @@ export class ThreadSessionRuntime {
     }
 
     const events = this.eventBuffer.flatMap((entry) => {
-      const eventSessionId = getOpencodeEventSessionId(entry.event)
+      const eventSessionId = entry.event.type === 'queue.question-handoff-started'
+        ? entry.event.properties.sessionID
+        : getOpencodeEventSessionId(entry.event)
       if (eventSessionId !== sessionId) {
         return []
       }
@@ -993,6 +1002,9 @@ export class ThreadSessionRuntime {
   }: {
     port: number
   }): void {
+    if (!this.state?.sessionId) {
+      return
+    }
     const currentController = this.state?.listenerController
     if (!currentController) {
       return
@@ -1064,15 +1076,19 @@ export class ThreadSessionRuntime {
   }
 
   private finalizeCompactedEventForEventBuffer(
-    event: OpenCodeEvent,
-  ): OpenCodeEvent {
+    event: EventBufferEvent,
+  ): EventBufferEvent {
     this.pruneLargeStringsForEventBuffer(event, new WeakSet<object>())
     return event
   }
 
   private compactEventForEventBuffer(
-    event: OpenCodeEvent,
-  ): OpenCodeEvent | undefined {
+    event: EventBufferEvent,
+  ): EventBufferEvent | undefined {
+    if (event.type === 'queue.question-handoff-started') {
+      return this.finalizeCompactedEventForEventBuffer(structuredClone(event))
+    }
+
     if (event.type === 'session.diff') {
       return undefined
     }
@@ -1174,7 +1190,7 @@ export class ThreadSessionRuntime {
     return this.finalizeCompactedEventForEventBuffer(compacted)
   }
 
-  private appendEventToBuffer(event: OpenCodeEvent): void {
+  private appendEventToBuffer(event: EventBufferEvent): void {
     const compactedEvent = this.compactEventForEventBuffer(event)
     if (!compactedEvent) {
       return
@@ -1216,6 +1232,15 @@ export class ThreadSessionRuntime {
     })
   }
 
+  private markQuestionQueueHandoffStarted(sessionId: string): void {
+    this.appendEventToBuffer({
+      type: 'queue.question-handoff-started',
+      properties: {
+        sessionID: sessionId,
+      },
+    })
+  }
+
   /**
    * Generic event waiter: polls the event buffer until a matching event
    * appears (with timestamp >= sinceTimestamp), or timeout/abort.
@@ -1225,11 +1250,11 @@ export class ThreadSessionRuntime {
    * the buffer that handleEvent() fills. Works for any event type.
    */
   private async waitForEvent(opts: {
-    predicate: (event: OpenCodeEvent) => boolean
+    predicate: (event: EventBufferEvent) => boolean
     sinceTimestamp: number
     timeoutMs: number
     pollMs?: number
-  }): Promise<OpenCodeEvent | undefined> {
+  }): Promise<EventBufferEvent | undefined> {
     const { predicate, sinceTimestamp, timeoutMs, pollMs = 50 } = opts
     const deadline = Date.now() + timeoutMs
 
@@ -1547,13 +1572,14 @@ export class ThreadSessionRuntime {
 
   // ── Typing Indicator Management ─────────────────────────────
 
+  private hasPendingQuestionUi(): boolean {
+    return [...pendingQuestionContexts.values()].some((ctx) => {
+      return ctx.thread.id === this.thread.id
+    })
+  }
+
   private hasPendingInteractiveUi(): boolean {
-    const hasPendingQuestion = [...pendingQuestionContexts.values()].some(
-      (ctx) => {
-        return ctx.thread.id === this.thread.id
-      },
-    )
-    if (hasPendingQuestion) {
+    if (this.hasPendingQuestionUi()) {
       return true
     }
     const hasPendingActionButtons = [...pendingActionButtonContexts.values()].some(
@@ -2069,6 +2095,8 @@ export class ThreadSessionRuntime {
   }
 
   private async handleMainPart(part: Part): Promise<void> {
+    const sessionId = this.state?.sessionId
+
     if (part.type === 'step-start') {
       this.ensureTypingNow()
       return
@@ -2084,13 +2112,42 @@ export class ThreadSessionRuntime {
 
       // Track task tool spawning subtask sessions
       if (part.tool === 'task' && !this.state?.sentPartIds.has(part.id)) {
-        const description = (part.state.input?.description as string) || ''
-        const agent = (part.state.input?.subagent_type as string) || 'task'
-        const childSessionId = (part.state.metadata?.sessionId as string) || ''
+        const description =
+          typeof part.state.input?.description === 'string'
+            ? part.state.input.description
+            : ''
+        const agent =
+          typeof part.state.input?.subagent_type === 'string'
+            ? part.state.input.subagent_type
+            : 'task'
+        const childSessionId =
+          typeof part.state.metadata?.sessionId === 'string'
+            ? part.state.metadata.sessionId
+            : ''
         if (description && childSessionId) {
           if ((await this.getVerbosity()) !== 'text_only') {
             const taskDisplay = `┣ ${agent} **${description}**`
-            await sendThreadMessage(this.thread, taskDisplay + '\n\n')
+            threadState.updateThread(this.threadId, (t) => {
+              const newIds = new Set(t.sentPartIds)
+              newIds.add(part.id)
+              return { ...t, sentPartIds: newIds }
+            })
+            const sendResult = await errore.tryAsync(() => {
+              return sendThreadMessage(this.thread, taskDisplay + '\n\n')
+            })
+            if (sendResult instanceof Error) {
+              threadState.updateThread(this.threadId, (t) => {
+                const newIds = new Set(t.sentPartIds)
+                newIds.delete(part.id)
+                return { ...t, sentPartIds: newIds }
+              })
+              discordLogger.error(
+                `ERROR: Failed to send task part ${part.id}:`,
+                sendResult,
+              )
+              return
+            }
+            await setPartMessage(part.id, sendResult.id, this.thread.id)
           }
         }
       }
@@ -2581,8 +2638,10 @@ export class ThreadSessionRuntime {
       },
     })
 
-    // Queue drain is intentionally NOT done here — tryDrainQueue() already
-    // blocks dispatch while interactive UI (question/permission) is pending.
+    this.maybeHandoffQueuedItemForPendingQuestion({
+      sessionId,
+      reason: 'question-shown',
+    })
   }
 
   private handleQuestionReplied(properties: { sessionID: string }): void {
@@ -2594,31 +2653,58 @@ export class ThreadSessionRuntime {
 
     // When a question is answered and the local queue has items, the model may
     // continue the same run without ever reaching the local-queue idle gate.
-    // Hand the queued items to OpenCode's own prompt queue immediately instead
-    // of waiting for tryDrainQueue() to see an idle session.
-    if (this.getQueueLength() > 0 && !this.questionReplyQueueHandoffPromise) {
-      logger.log(
-        `[QUESTION REPLIED] Queue has ${this.getQueueLength()} items, handing off to opencode queue`,
-      )
-      this.questionReplyQueueHandoffPromise = this.handoffQueuedItemsAfterQuestionReply({
-        sessionId,
-      }).catch((error) => {
-        logger.error('[QUESTION REPLIED] Failed to hand off queued messages:', error)
-        if (error instanceof Error) {
-          void notifyError(error, 'Failed to hand off queued messages after question reply')
-        }
-      }).finally(() => {
-        this.questionReplyQueueHandoffPromise = null
-      })
-    }
+    // Hand off only the next queued item to OpenCode immediately so the queue
+    // resumes, but keep later items local so their `» user:` indicators still
+    // appear one-by-one when they actually become active.
+    this.maybeHandoffQueuedItemForPendingQuestion({
+      sessionId,
+      reason: 'question-replied',
+    })
   }
 
-  // Detached helper promise for the "question answered while local queue has
-  // items" flow. Prevents starting two overlapping local->opencode queue
-  // handoff sequences when multiple question replies land close together.
-  private questionReplyQueueHandoffPromise: Promise<void> | null = null
+  // Detached helper promise for the "question blocks while local queue has
+  // items" flow. Prevents overlapping single-item handoffs when the question is
+  // shown, answered, and new /queue items arrive close together.
+  private questionQueueHandoffPromise: Promise<void> | null = null
 
-  private async handoffQueuedItemsAfterQuestionReply({
+  private maybeHandoffQueuedItemForPendingQuestion({
+    sessionId,
+    reason,
+  }: {
+    sessionId: string | undefined
+    reason: 'question-shown' | 'question-replied' | 'queue-added-during-question'
+  }): void {
+    if (!sessionId) {
+      return
+    }
+    if (didQuestionQueueHandoffSinceLatestQuestionAsked({
+      events: this.eventBuffer,
+      sessionId,
+    })) {
+      return
+    }
+    if (this.getQueueLength() === 0) {
+      return
+    }
+    if (this.questionQueueHandoffPromise) {
+      return
+    }
+    logger.log(
+      `[QUESTION QUEUE HANDOFF] Queue has ${this.getQueueLength()} items, handing off first item (${reason})`,
+    )
+    this.questionQueueHandoffPromise = this.handoffQueuedItemForPendingQuestion({
+      sessionId,
+    }).catch((error) => {
+      logger.error('[QUESTION QUEUE HANDOFF] Failed to hand off queued message:', error)
+      if (error instanceof Error) {
+        void notifyError(error, 'Failed to hand off queued message during pending question')
+      }
+    }).finally(() => {
+      this.questionQueueHandoffPromise = null
+    })
+  }
+
+  private async handoffQueuedItemForPendingQuestion({
     sessionId,
   }: {
     sessionId: string
@@ -2628,29 +2714,28 @@ export class ThreadSessionRuntime {
     }
     if (this.state?.sessionId !== sessionId) {
       logger.log(
-        `[QUESTION REPLIED] Session changed before queue handoff for thread ${this.threadId}`,
+        `[QUESTION QUEUE HANDOFF] Session changed before queue handoff for thread ${this.threadId}`,
       )
       return
     }
 
-    while (this.state?.sessionId === sessionId) {
-      const next = threadState.dequeueItem(this.threadId)
-      if (!next) {
-        return
-      }
-
-      const displayText = next.command
-        ? `/${next.command.name}`
-        : `${next.prompt.slice(0, 150)}${next.prompt.length > 150 ? '...' : ''}`
-      if (displayText.trim()) {
-        await sendThreadMessage(
-          this.thread,
-          `» **${next.username}:** ${displayText}`,
-        )
-      }
-
-      await this.submitViaOpencodeQueue(next)
+    const next = threadState.dequeueItem(this.threadId)
+    if (!next) {
+      return
     }
+
+    const displayText = next.command
+      ? `/${next.command.name}`
+      : `${next.prompt.slice(0, 150)}${next.prompt.length > 150 ? '...' : ''}`
+    if (displayText.trim()) {
+      await sendThreadMessage(
+        this.thread,
+        `» **${next.username}:** ${displayText}`,
+      )
+    }
+
+    this.markQuestionQueueHandoffStarted(sessionId)
+    await this.submitViaOpencodeQueue(next)
   }
 
   private async handleSessionStatus(properties: {
@@ -2783,6 +2868,10 @@ export class ThreadSessionRuntime {
     if (properties.variant === 'warning') {
       return
     }
+    const toastSessionId = extractToastSessionId({ message: properties.message })
+    if (!toastSessionId) {
+      return
+    }
     const toastMessage = stripToastSessionId({ message: properties.message }).trim()
     if (!toastMessage) {
       return
@@ -2822,10 +2911,6 @@ export class ThreadSessionRuntime {
         )
         skippedBySessionGuard = true
         return
-      }
-
-      if (!this.listenerLoopRunning) {
-        void this.startEventListener()
       }
 
       // Helper: stop typing and drain queued local messages on error.
@@ -2874,6 +2959,7 @@ export class ThreadSessionRuntime {
         channelId,
         appId: resolvedAppId,
         getClient,
+        directory: this.sdkDirectory,
         agentOverride: input.agent,
         modelOverride: input.model,
         force: createdNewSession,
@@ -2885,6 +2971,7 @@ export class ThreadSessionRuntime {
           sessionId: session.id,
           channelId,
           getClient,
+          directory: this.sdkDirectory,
         })
       })
       if (agentResult instanceof Error) {
@@ -2909,6 +2996,7 @@ export class ThreadSessionRuntime {
             appId: resolvedAppId,
             agentPreference: resolvedAgent,
             getClient,
+            directory: this.sdkDirectory,
           })
           if (modelInfo.type === 'none') {
             return undefined
@@ -3130,8 +3218,15 @@ export class ThreadSessionRuntime {
         : { queued: false }
 
       // Ensure listener is running
-      if (!this.listenerLoopRunning) {
+      if (!this.listenerLoopRunning && this.state?.sessionId) {
         void this.startEventListener()
+      }
+
+      if (this.hasPendingQuestionUi()) {
+        this.maybeHandoffQueuedItemForPendingQuestion({
+          sessionId: stateAfterEnqueue?.sessionId || this.state?.sessionId,
+          reason: 'queue-added-during-question',
+        })
       }
 
       await this.tryDrainQueue()
@@ -3398,6 +3493,11 @@ export class ThreadSessionRuntime {
     threadState.clearQueueItems(this.threadId)
   }
 
+  /** Remove a queued message by its 1-based position. */
+  removeQueuePosition(position: number): threadState.QueuedMessage | undefined {
+    return threadState.removeQueueItemAtPosition(this.threadId, position)
+  }
+
   // ── Queue Drain ─────────────────────────────────────────────
 
   /**
@@ -3527,6 +3627,7 @@ export class ThreadSessionRuntime {
       channelId,
       appId: resolvedAppId,
       getClient,
+      directory: this.sdkDirectory,
       agentOverride: input.agent,
       modelOverride: input.model,
       force: createdNewSession,
@@ -3538,6 +3639,7 @@ export class ThreadSessionRuntime {
         sessionId: session.id,
         channelId,
         getClient,
+        directory: this.sdkDirectory,
       })
     })
     if (earlyAgentResult instanceof Error) {
@@ -3569,6 +3671,7 @@ export class ThreadSessionRuntime {
           appId: resolvedAppId,
           agentPreference: earlyAgentPreference,
           getClient,
+          directory: this.sdkDirectory,
         })
         if (modelInfo.type === 'none') {
           return undefined

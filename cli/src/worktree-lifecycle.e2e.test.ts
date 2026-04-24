@@ -229,7 +229,7 @@ describe('worktree lifecycle', () => {
     if (warmup instanceof Error) {
       throw warmup
     }
-  }, 60_000)
+  }, 20_000)
 
   afterAll(async () => {
     if (directories) {
@@ -280,7 +280,7 @@ describe('worktree lifecycle', () => {
       ).catch(() => { return })
       fs.rmSync(directories.dataDir, { recursive: true, force: true })
     }
-  }, 10_000)
+  }, 5_000)
 
   test(
     'session responds after /new-worktree switches sdkDirectory in existing thread',
@@ -373,7 +373,12 @@ describe('worktree lifecycle', () => {
 
       // sdkDirectory should now point to the worktree path
       expect(runtimeAfter!.sdkDirectory).not.toBe(directories.projectDirectory)
-      expect(runtimeAfter!.sdkDirectory).toContain(`kimaki-${WORKTREE_NAME}`)
+      // Folder name drops the `opencode-kimaki-` prefix (branch name keeps it).
+      // See getManagedWorktreeDirectory in worktrees.ts.
+      expect(runtimeAfter!.sdkDirectory).toContain(WORKTREE_NAME)
+      expect(runtimeAfter!.sdkDirectory).toContain(
+        `${path.sep}worktrees${path.sep}`,
+      )
 
       // Snapshot uses dynamic worktree name so we verify structure, not exact text
       const text = await th.text()

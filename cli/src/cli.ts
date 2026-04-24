@@ -64,7 +64,7 @@ import {
   buildSessionSearchSnippet,
   getPartSearchTexts,
 } from './session-search.js'
-import { formatWorktreeName } from './commands/new-worktree.js'
+import { formatWorktreeName, formatAutoWorktreeName } from './commands/new-worktree.js'
 import { WORKTREE_PREFIX } from './commands/merge-worktree.js'
 import type { ThreadStartMarker } from './system-message.js'
 import { sendWelcomeMessage } from './onboarding-welcome.js'
@@ -90,6 +90,7 @@ import { createDiscordRest, discordApiUrl, getDiscordRestApiUrl, getGatewayProxy
 import crypto from 'node:crypto'
 import path from 'node:path'
 import fs from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import * as errore from 'errore'
 
 import { createLogger, formatErrorWithStack, initLogFile, LogPrefix } from './logger.js'
@@ -127,6 +128,8 @@ import {
 import {
   accountLabel,
   accountsFilePath,
+  authFilePath,
+  getCurrentAnthropicAccount,
   loadAccountStore,
   removeAccount,
 } from './anthropic-auth-state.js'
@@ -141,7 +144,7 @@ const cliLogger = createLogger(LogPrefix.CLI)
 // These are hardcoded because they're deploy-time constants for the gateway infrastructure.
 const KIMAKI_GATEWAY_PROXY_URL =
   process.env.KIMAKI_GATEWAY_PROXY_URL ||
-  'wss://discord-gateway.kimaki.xyz'
+  'wss://discord-gateway.kimaki.dev'
 
 const KIMAKI_GATEWAY_PROXY_REST_BASE_URL = getGatewayProxyRestBaseUrl({
   gatewayUrl: KIMAKI_GATEWAY_PROXY_URL,
@@ -1840,6 +1843,24 @@ cli
     '--gateway-callback-url <url>',
     'After gateway OAuth install, redirect to this URL instead of the default success page (appends ?guild_id=<id>)',
   )
+  .option(
+    '--enable-skill <name>',
+    z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Whitelist a built-in skill by name. Only the listed skills are injected into the model (all others are hidden via an opencode permission.skill deny-all rule). Repeatable: pass --enable-skill multiple times. Mutually exclusive with --disable-skill. See https://github.com/remorses/kimaki/tree/main/skills for available skills.',
+      ),
+  )
+  .option(
+    '--disable-skill <name>',
+    z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Blacklist a built-in skill by name. Listed skills are hidden from the model. Repeatable: pass --disable-skill multiple times. Mutually exclusive with --enable-skill. See https://github.com/remorses/kimaki/tree/main/skills for available skills.',
+      ),
+  )
   .action(
     async (options: {
       restartOnboarding?: boolean
@@ -1856,6 +1877,8 @@ cli
       noSentry?: boolean
       gateway?: boolean
       gatewayCallbackUrl?: string
+      enableSkill?: string[]
+      disableSkill?: string[]
     }) => {
       // Guard: only one kimaki bot process can run at a time (they share a lock
       // port). Running `kimaki` here would kill the already-running bot process
@@ -1899,6 +1922,47 @@ cli
           }
         }
 
+        // --enable-skill and --disable-skill are mutually exclusive: the user
+        // either whitelists a small allowlist or blacklists a few unwanted
+        // skills, never both. Applied later in opencode.ts as permission.skill
+        // rules via computeSkillPermission().
+        const enabledSkills = options.enableSkill ?? []
+        const disabledSkills = options.disableSkill ?? []
+        if (enabledSkills.length > 0 && disabledSkills.length > 0) {
+          cliLogger.error(
+            'Cannot use --enable-skill and --disable-skill at the same time. Use one or the other.',
+          )
+          process.exit(EXIT_NO_RESTART)
+        }
+        // Soft-validate skill names against the bundled skills/ folder. Users
+        // may rely on skills loaded from their own .opencode / .claude / .agents
+        // dirs, so unknown names only emit a warning rather than hard-failing.
+        if (enabledSkills.length > 0 || disabledSkills.length > 0) {
+          const bundledSkillsDir = path.resolve(
+            path.dirname(fileURLToPath(import.meta.url)),
+            '..',
+            'skills',
+          )
+          const availableBundledSkills = (() => {
+            try {
+              return fs
+                .readdirSync(bundledSkillsDir, { withFileTypes: true })
+                .filter((entry) => entry.isDirectory())
+                .map((entry) => entry.name)
+            } catch {
+              return [] as string[]
+            }
+          })()
+          const availableSet = new Set(availableBundledSkills)
+          for (const name of [...enabledSkills, ...disabledSkills]) {
+            if (!availableSet.has(name)) {
+              cliLogger.warn(
+                `Skill "${name}" is not a bundled kimaki skill. Rule will still apply (user-provided skills from .opencode/.claude/.agents dirs may match). Available bundled skills: ${availableBundledSkills.join(', ')}`,
+              )
+            }
+          }
+        }
+
         store.setState({
           ...(options.verbosity && {
             defaultVerbosity: options.verbosity as
@@ -1908,7 +1972,20 @@ cli
           }),
           ...(options.mentionMode && { defaultMentionMode: true }),
           ...(options.noCritique && { critiqueEnabled: false }),
+          ...(enabledSkills.length > 0 && { enabledSkills }),
+          ...(disabledSkills.length > 0 && { disabledSkills }),
         })
+
+        if (enabledSkills.length > 0) {
+          cliLogger.log(
+            `Skill whitelist enabled: only [${enabledSkills.join(', ')}] will be injected`,
+          )
+        }
+        if (disabledSkills.length > 0) {
+          cliLogger.log(
+            `Skill blacklist enabled: [${disabledSkills.join(', ')}] will be hidden`,
+          )
+        }
 
         if (options.verbosity) {
           cliLogger.log(`Default verbosity: ${options.verbosity}`)
@@ -2382,36 +2459,20 @@ cli
     '--wait',
     'Wait for session to complete, then print session text to stdout',
   )
-  .action(
-    async (options: {
-      channel?: string
-      project?: string
-      prompt?: string
-      name?: string
-      appId?: string
-      notifyOnly?: boolean
-      worktree?: string | boolean
-      cwd?: string
-      user?: string
-      agent?: string
-      model?: string
-      permission?: string[]
-      injectionGuard?: string[]
-      sendAt?: string
-      thread?: string
-      session?: string
-      wait?: boolean
-    }) => {
+  .action(async (options) => {
       try {
+        // `--name` / `--app-id` are optional-value flags: `undefined` when
+        // omitted, `''` when passed bare, a real string when given a value.
+        // `||` collapses `''` to `undefined` for downstream consumers.
+        const optionAppId = options.appId || undefined
         let {
           channel: channelId,
           prompt,
-          name,
-          appId: optionAppId,
           notifyOnly,
           thread: threadId,
           session: sessionId,
         } = options
+        let name: string | undefined = options.name || undefined
         const { project: projectPath } = options
         const sendAt = options.sendAt
 
@@ -2862,12 +2923,12 @@ cli
           (cleanPrompt.length > 80
             ? cleanPrompt.slice(0, 77) + '...'
             : cleanPrompt)
+        // Explicit string => use as-is via formatWorktreeName (no vowel strip).
+        // Boolean true => derived from thread/prompt, compress via formatAutoWorktreeName.
         const worktreeName = options.worktree
-          ? formatWorktreeName(
-              typeof options.worktree === 'string'
-                ? options.worktree
-                : baseThreadName,
-            )
+          ? typeof options.worktree === 'string'
+            ? formatWorktreeName(options.worktree)
+            : formatAutoWorktreeName(baseThreadName)
           : undefined
         const threadName = worktreeName
           ? `${WORKTREE_PREFIX}${baseThreadName}`
@@ -3182,6 +3243,42 @@ cli
       console.log(`${active} ${index + 1}. ${accountLabel(account)}`)
     })
 
+    process.exit(0)
+  })
+
+cli
+  .command(
+    'anthropic-accounts current',
+    'Show the current Anthropic OAuth account being used, if any',
+  )
+  .action(async () => {
+    const current = await getCurrentAnthropicAccount()
+    console.log(`Store: ${accountsFilePath()}`)
+    console.log(`Auth: ${authFilePath()}`)
+
+    if (!current) {
+      console.log('No active Anthropic OAuth account configured.')
+      process.exit(0)
+    }
+
+    const lines: string[] = []
+    lines.push(`Current: ${accountLabel(current.account || current.auth, current.index)}`)
+
+    if (current.account?.email) {
+      lines.push(`Email: ${current.account.email}`)
+    } else {
+      lines.push('Email: unavailable')
+    }
+
+    if (current.account?.accountId) {
+      lines.push(`Account ID: ${current.account.accountId}`)
+    }
+
+    if (!current.account) {
+      lines.push('Rotation pool entry: not found')
+    }
+
+    console.log(lines.join('\n'))
     process.exit(0)
   })
 
@@ -3693,13 +3790,15 @@ cli
   )
   .option('-g, --guild <guildId>', 'Discord guild/server ID (required)')
   .option('-q, --query [query]', 'Search query to filter users by name')
-  .action(async (options: { guild?: string; query?: string }) => {
+  .action(async (options) => {
     try {
       if (!options.guild) {
         cliLogger.error('Guild ID is required. Use --guild <guildId>')
         process.exit(EXIT_NO_RESTART)
       }
       const guildId = String(options.guild)
+      // Bare `--query` comes through as `''`; collapse it to undefined
+      const query = options.query || undefined
 
       await initDatabase()
       const { token: botToken } = await resolveBotCredentials()
@@ -3711,9 +3810,9 @@ cli
       }
 
       const members: GuildMember[] = await (async () => {
-        if (options.query) {
+        if (query) {
           return (await rest.get(Routes.guildMembersSearch(guildId), {
-            query: new URLSearchParams({ query: options.query, limit: '20' }),
+            query: new URLSearchParams({ query, limit: '20' }),
           })) as GuildMember[]
         }
         return (await rest.get(Routes.guildMembers(guildId), {
@@ -3722,8 +3821,8 @@ cli
       })()
 
       if (members.length === 0) {
-        const msg = options.query
-          ? `No users found matching "${options.query}"`
+        const msg = query
+          ? `No users found matching "${query}"`
           : 'No users found in guild'
         cliLogger.log(msg)
         process.exit(0)
@@ -3736,8 +3835,8 @@ cli
         })
         .join('\n')
 
-      const header = options.query
-        ? `Found ${members.length} users matching "${options.query}":`
+      const header = query
+        ? `Found ${members.length} users matching "${query}":`
         : `Found ${members.length} users:`
 
       console.log(`${header}\n${userList}`)
@@ -3761,14 +3860,7 @@ cli
   .option('-h, --host [host]', 'Local host (default: localhost)')
   .option('-s, --server [url]', 'Tunnel server URL')
   .option('-k, --kill', 'Kill any existing process on the port before starting')
-  .action(
-    async (options: {
-      port?: string
-      tunnelId?: string
-      host?: string
-      server?: string
-      kill?: boolean
-    }) => {
+  .action(async (options) => {
       const { runTunnel, parseCommandFromArgv, CLI_NAME } = await import(
         'traforo/run-tunnel'
       )
@@ -3790,10 +3882,10 @@ cli
 
       await runTunnel({
         port,
-        tunnelId: options.tunnelId,
-        localHost: options.host,
-        baseDomain: 'kimaki.xyz',
-        serverUrl: options.server,
+        tunnelId: options.tunnelId || undefined,
+        localHost: options.host || undefined,
+        baseDomain: 'kimaki.dev',
+        serverUrl: options.server || undefined,
         command: command.length > 0 ? command : undefined,
         kill: options.kill,
       })
@@ -3803,7 +3895,7 @@ cli
 cli
   .command(
     'screenshare',
-    'Share your screen via VNC tunnel. Auto-stops after 30 minutes. Runs until Ctrl+C. Use tmux to run in background.',
+    'Share your screen via VNC tunnel. Auto-stops after 30 minutes. Runs until Ctrl+C. For background usage, start with bunx tuistory --help, then run it in a tuistory session.',
   )
   .action(async () => {
     const { startScreenshare } = await import(
