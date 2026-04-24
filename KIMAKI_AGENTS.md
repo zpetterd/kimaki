@@ -25,7 +25,7 @@ kimaki is a monorepo with three main packages that communicate via a shared Post
 ┌─────────────────────┐   ┌──────────────────────────────────┐
 │  gateway-proxy/      │   │  website/                        │
 │  (Rust, fly.io)      │   │  (Cloudflare Worker, Hono)       │
-│                      │   │  https://kimaki.xyz           │
+│                      │   │  https://kimaki.dev           │
 │  Sits between the    │   │                                  │
 │  CLI and Discord.    │   │  GET /oauth/callback              │
 │  One shared bot for  │   │    → upserts gateway_clients row │
@@ -97,7 +97,7 @@ multi-tenant REST safety invariant:
 the gateway mode onboarding (in `cli/src/cli.ts`, the `run()` function) works as follows:
 
 1. CLI generates `clientId` (UUID) + `clientSecret` (32-byte hex)
-2. builds Discord OAuth URL with `state=JSON({clientId, clientSecret})` and `redirect_uri=https://kimaki.xyz/api/auth/callback/discord`
+2. builds Discord OAuth URL with `state=JSON({clientId, clientSecret})` and `redirect_uri=https://kimaki.dev/api/auth/callback/discord`
 3. opens browser to the Discord install URL
 4. user authorizes the shared Kimaki bot in their server
 5. Discord redirects to `website/src/routes/oauth-callback.tsx` with `guild_id` + `state` — website upserts `gateway_clients` row in Postgres
@@ -229,6 +229,8 @@ when using `@prisma/adapter-libsql` with `file::memory:`, always use `file::memo
 
 errore is a submodule. should always be in main. make sure it is never in detached state.
 
+when pulling submodules and they jump to a new commit, commit that submodule pointer update right away before doing other work. otherwise critique diffs later will include the noisy submodule jump along with the real changes.
+
 it is a package for using errors as values in ts.
 
 this whole codebase uses errore.org conventions. ALWAYS read the errore skill before editing any code.
@@ -341,10 +343,10 @@ cd cli
 VITEST_CPU_PROF=1 pnpm test --run src/some-file.e2e.test.ts
 ```
 
-to get a top-down self-time report without opening a browser, use profano (a workspace package in `profano/`):
+to get a top-down self-time report without opening a browser, use profano:
 
 ```bash
-node ../profano/dist/cli.js tmp/cpu-profiles/CPU.*.cpuprofile
+bunx profano tmp/cpu-profiles/CPU.*.cpuprofile
 ```
 
 for an interactive flame chart in the browser, use cpupro:
@@ -433,7 +435,7 @@ OpenCode plugin files must also avoid importing `cli/src/logger.ts`. That logger
 
 ## skills folder
 
-skills is a symlink to cli/skills. this is a folder of skills for kimaki. loaded by all kimaki users. some skills are synced from github repos. see cli/scripts/sync-skills.ts. so never manually update them. instead if need to updaste them start kimaki threads on those project, found via kimaki cli.
+skills lives at the repository root in `skills/`. build and publish scripts copy it into `cli/skills/` so the npm package still ships the bundled skills. some skills are synced from github repos. see cli/scripts/sync-skills.ts. so never manually update synced copies. instead if need to update them start kimaki threads on those project, found via kimaki cli.
 
 ## discord-digital-twin e2e style
 
@@ -478,12 +480,16 @@ opencode uses the event subscription (sdk call `event.subscribe`) as single sour
 
 prefer event sourcing over mirrored mutable run state.
 
+always read the `event-sourcing-state` skill before updating code in `cli/src/session-handler/thread-session-runtime.ts`.
+
 why this is preferred:
 
 - one source of truth: the event stream. no duplicated "phase" or "current run" state that can desync.
 - easier debugging: read the jsonl stream and replay decisions from history.
 - easier testing: derivation logic is pure and deterministic with fixture inputs.
 - fewer race bugs: state is derived from observed events, not guessed from local transitions.
+
+when the user mentions a specific kimaki session while reporting a bug, always export its jsonl first with `kimaki session export-events-jsonl --session <id> --out ./tmp/<id>.jsonl` and inspect that stream before guessing about runtime state.
 
 write derivation as pure functions that accept events and return computed state.
 prefer existing derivation helpers from `event-stream-state.ts` (for example

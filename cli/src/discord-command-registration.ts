@@ -182,7 +182,7 @@ export async function registerCommands({
     new SlashCommandBuilder()
       .setName('new-worktree')
       .setDescription(
-        truncateCommandDescription('Create a git worktree branch from HEAD by default. Optionally pick a base branch.'),
+        truncateCommandDescription('Create a git worktree from the current HEAD by default. Optionally pick a base branch.'),
       )
       .addStringOption((option) => {
         option
@@ -198,7 +198,7 @@ export async function registerCommands({
         option
           .setName('base-branch')
           .setDescription(
-            truncateCommandDescription('Branch to create the worktree from (default: HEAD)'),
+            truncateCommandDescription('Branch to create the worktree from (default: current HEAD)'),
           )
           .setRequired(false)
           .setAutocomplete(true)
@@ -298,6 +298,21 @@ export async function registerCommands({
       .setDMPermission(false)
       .toJSON(),
     new SlashCommandBuilder()
+      .setName('add-dir')
+      .setDescription(
+        truncateCommandDescription('Allow the current session to access an extra directory or * for all folders'),
+      )
+      .addStringOption((option) => {
+        option
+          .setName('directory')
+          .setDescription(truncateCommandDescription('Directory to allow, resolved from the current worktree. Use * for all folders'))
+          .setRequired(false)
+
+        return option
+      })
+      .setDMPermission(false)
+      .toJSON(),
+    new SlashCommandBuilder()
       .setName('abort')
       .setDescription(truncateCommandDescription('Abort the current OpenCode request in this thread'))
       .setDMPermission(false)
@@ -326,6 +341,11 @@ export async function registerCommands({
       .setDMPermission(false)
       .toJSON(),
     new SlashCommandBuilder()
+      .setName('fork-subagent')
+      .setDescription(truncateCommandDescription('Fork a subagent task session into a new thread'))
+      .setDMPermission(false)
+      .toJSON(),
+    new SlashCommandBuilder()
       .setName('btw')
       .setDescription(truncateCommandDescription('Ask something without polluting or blocking the current session'))
       .addStringOption((option) => {
@@ -345,7 +365,7 @@ export async function registerCommands({
     new SlashCommandBuilder()
       .setName('model-variant')
       .setDescription(
-        truncateCommandDescription('Quickly change the thinking level variant for the current model'),
+        truncateCommandDescription('Change thinking level for current model. Tied to the model; lost when you switch models'),
       )
       .setDMPermission(false)
       .toJSON(),
@@ -384,6 +404,16 @@ export async function registerCommands({
     new SlashCommandBuilder()
       .setName('clear-queue')
       .setDescription(truncateCommandDescription('Clear all queued messages in this thread'))
+      .addIntegerOption((option) => {
+        option
+          .setName('position')
+          .setDescription(
+            truncateCommandDescription('1-based queued message position to clear (default: all)'),
+          )
+          .setMinValue(1)
+
+        return option
+      })
       .setDMPermission(false)
       .toJSON(),
     new SlashCommandBuilder()
@@ -486,6 +516,13 @@ export async function registerCommands({
     new SlashCommandBuilder()
       .setName('screenshare-stop')
       .setDescription(truncateCommandDescription('Stop screen sharing'))
+      .setDMPermission(false)
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('vscode')
+      .setDescription(
+        truncateCommandDescription('Open VS Code in the browser for this project or worktree (auto-stops after 30 minutes)'),
+      )
       .setDMPermission(false)
       .toJSON(),
   ]

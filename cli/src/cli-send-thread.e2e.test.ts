@@ -243,7 +243,7 @@ describe('kimaki send --channel thread creation', () => {
     if (warmup instanceof Error) {
       throw warmup
     }
-  }, 60_000)
+  }, 20_000)
 
   afterAll(async () => {
     if (directories) {
@@ -275,7 +275,7 @@ describe('kimaki send --channel thread creation', () => {
     if (directories) {
       fs.rmSync(directories.dataDir, { recursive: true, force: true })
     }
-  }, 10_000)
+  }, 5_000)
 
   test(
     'kimaki send --prompt "/hello-test-cmd" falls through as text when registeredUserCommands is empty (repro #97)',
@@ -339,14 +339,13 @@ describe('kimaki send --channel thread creation', () => {
         })
 
         const allContent = botReplies.map((m) => {
-          return m.content.slice(0, 200)
+          return m.content
         })
-        expect(allContent).toMatchInlineSnapshot(`
-          [
-            "✗ opencode session error: Command not found: "hello-test". Available commands: init, review, goke, security-review, jitter, proxyman, gitchamber, event-sourcing-state, usecomputer, spiceflow, batch, x",
-            "✗ OpenCode API error: Command not found: "hello-test". Available commands: init, review, goke, security-review, jitter, proxyman, gitchamber, event-sourcing-state, usecomputer, spiceflow, batch, x-art",
-          ]
-        `)
+        expect(
+          allContent.some((content) => {
+            return content.includes('Command not found: "hello-test"')
+          }),
+        ).toBe(true)
       } finally {
         store.setState({ registeredUserCommands: prevCommands })
       }

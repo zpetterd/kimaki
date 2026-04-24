@@ -1,7 +1,6 @@
 // OpenCode plugin that injects synthetic message parts for context awareness:
 // - Git branch / detached HEAD changes
 // - Working directory (pwd) changes (e.g. after /new-worktree mid-session)
-// - MEMORY.md table of contents on first message
 // - MEMORY.md reminder after a large assistant reply
 // - Onboarding tutorial instructions (when TUTORIAL_WELCOME_TEXT detected)
 //
@@ -18,8 +17,6 @@
 
 import type { Plugin } from '@opencode-ai/plugin'
 import crypto from 'node:crypto'
-import fs from 'node:fs'
-import path from 'node:path'
 import * as errore from 'errore'
 import {
   createPluginLogger,
@@ -29,7 +26,6 @@ import {
 import { setDataDir } from './config.js'
 import { initSentry, notifyError } from './sentry.js'
 import { execAsync } from './exec-async.js'
-import { condenseMemoryMd } from './condense-memory.js'
 import {
   ONBOARDING_TUTORIAL_INSTRUCTIONS,
   TUTORIAL_WELCOME_TEXT,
@@ -49,7 +45,6 @@ type GitState = {
 // All per-session mutable state in one place. One Map entry, one delete.
 type SessionState = {
   gitState: GitState | undefined
-  memoryInjected: boolean
   lastMemoryReminderAssistantMessageId: string | undefined
   tutorialInjected: boolean
   // Last directory observed via session.get(). Refreshed on each real user
@@ -58,17 +53,6 @@ type SessionState = {
   resolvedDirectory: string | undefined
   // Last directory we announced via pwd injection.
   announcedDirectory: string | undefined
-}
-
-function createSessionState(): SessionState {
-  return {
-    gitState: undefined,
-    memoryInjected: false,
-    lastMemoryReminderAssistantMessageId: undefined,
-    tutorialInjected: false,
-    resolvedDirectory: undefined,
-    announcedDirectory: undefined,
-  }
 }
 
 // Minimal type for the opencode plugin client (v1 SDK style with path objects).
@@ -99,8 +83,10 @@ export function shouldInjectBranch({
   if (previousGitState && previousGitState.key === currentGitState.key) {
     return { inject: false }
   }
-  const text = currentGitState.warning || `\n[current git branch is ${currentGitState.label}]`
-  return { inject: true, text }
+  // Trailing newline so this synthetic part does not fuse with the next text
+  // part when the model concatenates message parts.
+  const base = currentGitState.warning || `\n[current git branch is ${currentGitState.label}]`
+  return { inject: true, text: `${base}\n` }
 }
 
 export function shouldInjectPwd({
@@ -123,11 +109,17 @@ export function shouldInjectPwd({
 
   return {
     inject: true,
+    // Trailing newline so this synthetic part does not fuse with the next text
+    // part when the model concatenates message parts.
     text:
-      `\n[working directory changed. Previous working directory: ${priorDirectory}. ` +
-      `Current working directory: ${currentDir}. ` +
-      `You should read, write, and edit files under ${currentDir}. ` +
-      `Do NOT read, write, or edit files under ${priorDirectory}.]`,
+      `\n[working directory changed (cwd / pwd has changed). ` +
+      `The user expects you to edit files in the new cwd. ` +
+      `Previous folder (DO NOT TOUCH): ${priorDirectory}. ` +
+      `New folder (new cwd / pwd, edit files here): ${currentDir}. ` +
+      `You MUST read, write, and edit files only under the new folder ${currentDir}. ` +
+      `You MUST NOT read, write, or edit any files under the previous folder ${priorDirectory} — ` +
+      `that folder is a separate checkout and the user or another agent may be actively working there, ` +
+      `so writing to it would override their unrelated changes.]\n`,
   }
 }
 
@@ -145,10 +137,6 @@ type AssistantMessageInfo = {
   role: string
   time?: { completed?: number; created?: number }
   tokens?: AssistantTokenUsage
-}
-
-function getOutputTokenTotal(tokens: AssistantTokenUsage): number {
-  return Math.max(0, tokens.output + tokens.reasoning)
 }
 
 export function shouldInjectMemoryReminderFromLatestAssistant({
@@ -175,7 +163,10 @@ export function shouldInjectMemoryReminderFromLatestAssistant({
   if (lastMemoryReminderAssistantMessageId === latestAssistantMessage.id) {
     return { inject: false }
   }
-  const outputTokens = getOutputTokenTotal(latestAssistantMessage.tokens)
+  const outputTokens = Math.max(
+    0,
+    latestAssistantMessage.tokens.output + latestAssistantMessage.tokens.reasoning,
+  )
   if (outputTokens < threshold) {
     return { inject: false }
   }
@@ -311,7 +302,13 @@ const contextAwarenessPlugin: Plugin = async ({ directory, client }) => {
     if (existing) {
       return existing
     }
-    const state = createSessionState()
+    const state: SessionState = {
+      gitState: undefined,
+      lastMemoryReminderAssistantMessageId: undefined,
+      tutorialInjected: false,
+      resolvedDirectory: undefined,
+      announcedDirectory: undefined,
+    }
     sessions.set(sessionID, state)
     return state
   }
@@ -338,7 +335,7 @@ const contextAwarenessPlugin: Plugin = async ({ directory, client }) => {
               sessionID,
               messageID: firstTextPart.messageID,
               type: 'text' as const,
-              text: `<system-reminder>\n${ONBOARDING_TUTORIAL_INSTRUCTIONS}\n</system-reminder>`,
+              text: `<system-reminder>\n${ONBOARDING_TUTORIAL_INSTRUCTIONS}\n</system-reminder>\n`,
               synthetic: true,
             })
           }
@@ -412,26 +409,6 @@ const contextAwarenessPlugin: Plugin = async ({ directory, client }) => {
             })
           }
 
-          // -- MEMORY.md injection --
-          if (!state.memoryInjected) {
-            state.memoryInjected = true
-            const memoryPath = path.join(effectiveDirectory, 'MEMORY.md')
-            const memoryContent = await fs.promises
-              .readFile(memoryPath, 'utf-8')
-              .catch(() => null)
-            if (memoryContent) {
-              const condensed = condenseMemoryMd(memoryContent)
-              output.parts.push({
-                id: `prt_${crypto.randomUUID()}`,
-                sessionID,
-                messageID,
-                type: 'text' as const,
-                text: `<system-reminder>Project memory from MEMORY.md (condensed table of contents, line numbers shown):\n${condensed}\nOnly headings are shown above — section bodies are hidden. Use Grep to search MEMORY.md for specific topics, or Read with offset and limit to read a section's content. When writing to MEMORY.md, keep titles concise (under 10 words) and content brief (2-3 sentences max). Only track non-obvious learnings that prevent future mistakes and are not already documented in code comments or AGENTS.md. Do not duplicate information that is self-evident from the code.</system-reminder>`,
-                synthetic: true,
-              })
-            }
-          }
-
           const memoryReminder = shouldInjectMemoryReminderFromLatestAssistant({
             lastMemoryReminderAssistantMessageId:
               state.lastMemoryReminderAssistantMessageId,
@@ -443,7 +420,7 @@ const contextAwarenessPlugin: Plugin = async ({ directory, client }) => {
               sessionID,
               messageID,
               type: 'text' as const,
-              text: '<system-reminder>The previous assistant message was large. If the conversation had non-obvious learnings that prevent future mistakes and are not already in code comments or AGENTS.md, add them to MEMORY.md with concise titles and brief content (2-3 sentences max).</system-reminder>',
+              text: '<system-reminder>The previous assistant message was large. If the conversation had non-obvious learnings that prevent future mistakes and are not already in code comments or AGENTS.md, add them to MEMORY.md with concise titles and brief content (2-3 sentences max).</system-reminder>\n',
               synthetic: true,
             })
             state.lastMemoryReminderAssistantMessageId =

@@ -15,9 +15,11 @@
 
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -64,6 +66,7 @@ import {
   prependPathEntry,
   selectResolvedCommand,
 } from './opencode-command.js'
+import { computeSkillPermission } from './skill-filter.js'
 
 const opencodeLogger = createLogger(LogPrefix.OPENCODE)
 
@@ -76,6 +79,38 @@ const STARTUP_STDERR_LINE_MAX_LENGTH = 120
 const STARTUP_ERROR_REASON_MAX_LENGTH = 1500
 const ANSI_ESCAPE_REGEX =
   /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g
+
+async function requestHealthcheck({
+  url,
+}: {
+  url: string
+}): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      url,
+      {
+        method: 'GET',
+        headers: {
+          connection: 'close',
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+        })
+        res.on('end', () => {
+          resolve({
+            status: res.statusCode || 0,
+            body: Buffer.concat(chunks).toString('utf-8'),
+          })
+        })
+      },
+    )
+    req.on('error', reject)
+    req.end()
+  })
+}
 
 function truncateWithEllipsis({
   value,
@@ -97,11 +132,8 @@ function stripAnsiCodes(value: string): string {
   return value.replaceAll(ANSI_ESCAPE_REGEX, '')
 }
 
-function splitOutputChunkLines(chunk: string): string[] {
-  return chunk
-    .split(/\r?\n/g)
-    .map((line) => stripAnsiCodes(line).trim())
-    .filter((line) => line.length > 0)
+function sanitizeOutputLine(line: string): string {
+  return stripAnsiCodes(line).trim()
 }
 
 function sanitizeForCodeFence(line: string): string {
@@ -110,23 +142,52 @@ function sanitizeForCodeFence(line: string): string {
 
 function pushStartupStderrTail({
   stderrTail,
-  chunk,
+  line,
 }: {
   stderrTail: string[]
-  chunk: string
+  line: string
 }): void {
-  const incomingLines = splitOutputChunkLines(chunk)
-  const truncatedLines = incomingLines.map((line) => {
-    const sanitizedLine = sanitizeForCodeFence(line)
-    return truncateWithEllipsis({
-      value: sanitizedLine,
-      maxLength: STARTUP_STDERR_LINE_MAX_LENGTH,
-    })
+  const sanitizedLine = sanitizeOutputLine(line)
+  if (sanitizedLine.length === 0) {
+    return
+  }
+
+  const truncatedLine = truncateWithEllipsis({
+    value: sanitizeForCodeFence(sanitizedLine),
+    maxLength: STARTUP_STDERR_LINE_MAX_LENGTH,
   })
-  stderrTail.push(...truncatedLines)
+
+  stderrTail.push(truncatedLine)
   if (stderrTail.length > STARTUP_STDERR_TAIL_LIMIT) {
     stderrTail.splice(0, stderrTail.length - STARTUP_STDERR_TAIL_LIMIT)
   }
+}
+
+function subscribeToProcessLogStream({
+  stream,
+  onLine,
+}: {
+  stream: NodeJS.ReadableStream | null | undefined
+  onLine: (line: string) => void
+}): readline.Interface | null {
+  if (!stream) {
+    return null
+  }
+
+  const logReader = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity,
+  })
+
+  logReader.on('line', (line) => {
+    const sanitizedLine = sanitizeOutputLine(line)
+    if (sanitizedLine.length === 0) {
+      return
+    }
+    onLine(sanitizedLine)
+  })
+
+  return logReader
 }
 
 function buildStartupTimeoutReason({
@@ -195,9 +256,6 @@ let serverRetryCount = 0
 const serverLifecycleListeners = new Set<(event: ServerLifecycleEvent) => void>()
 let processCleanupHandlersRegistered = false
 let startingServerProcess: ChildProcess | null = null
-
-// Cached SDK clients per directory. Each client has a fixed
-// x-opencode-directory header pointing to its project directory.
 const clientCache = new Map<string, OpencodeClient>()
 
 function notifyServerLifecycle(event: ServerLifecycleEvent): void {
@@ -392,18 +450,23 @@ async function getOpenPort(): Promise<number> {
 
 async function waitForServer({
   port,
+  directory,
   maxAttempts = 300,
   startupStderrTail,
 }: {
   port: number
+  directory?: string
   maxAttempts?: number
   startupStderrTail: string[]
 }): Promise<ServerStartError | true> {
-  const endpoint = `http://127.0.0.1:${port}/api/health`
+  const endpoint = new URL(`http://127.0.0.1:${port}/api/health`)
+  if (directory) {
+    endpoint.searchParams.set('directory', directory)
+  }
   for (let i = 0; i < maxAttempts; i++) {
     const response = await errore.tryAsync({
-      try: () => fetch(endpoint),
-      catch: (e) => new FetchError({ url: endpoint, cause: e }),
+      try: () => requestHealthcheck({ url: endpoint.toString() }),
+      catch: (e) => new FetchError({ url: endpoint.toString(), cause: e }),
     })
     if (response instanceof Error) {
       // Connection refused or other transient errors - continue polling.
@@ -415,7 +478,7 @@ async function waitForServer({
     if (response.status < 500) {
       return true
     }
-    const body = await response.text()
+    const body = response.body
     // Fatal errors that won't resolve with retrying
     if (body.includes('BunInstallFailedError')) {
       return new ServerStartError({ port, reason: body.slice(0, 200) })
@@ -438,8 +501,24 @@ async function waitForServer({
 
 // In-flight promise to prevent concurrent startups from racing
 let startingServer: Promise<ServerStartError | SingleServer> | null = null
+let preferredStartupDirectory: string | null = null
 
-async function ensureSingleServer(): Promise<ServerStartError | SingleServer> {
+function ensureOpencodeHomeDirectories({
+  directories,
+}: {
+  directories: Record<string, string>
+}) {
+  Object.values(directories).map((directory) => {
+    fs.mkdirSync(directory, { recursive: true })
+  })
+}
+
+async function ensureSingleServer({
+  directory,
+}: {
+  directory?: string
+} = {}): Promise<ServerStartError | SingleServer> {
+  const startupDirectory = directory || preferredStartupDirectory || undefined
   if (singleServer && !singleServer.process.killed) {
     return singleServer
   }
@@ -449,7 +528,7 @@ async function ensureSingleServer(): Promise<ServerStartError | SingleServer> {
     return startingServer
   }
 
-  startingServer = startSingleServer()
+  startingServer = startSingleServer({ directory: startupDirectory })
   try {
     return await startingServer
   } finally {
@@ -457,7 +536,11 @@ async function ensureSingleServer(): Promise<ServerStartError | SingleServer> {
   }
 }
 
-async function startSingleServer(): Promise<ServerStartError | SingleServer> {
+async function startSingleServer({
+  directory,
+}: {
+  directory?: string
+} = {}): Promise<ServerStartError | SingleServer> {
   ensureProcessCleanupHandlersRegistered()
 
   const port = await getOpenPort()
@@ -489,6 +572,9 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
   const opencodeConfigDir = path
     .join(os.homedir(), '.config', 'opencode')
     .replaceAll('\\', '/')
+  const opensrcDir = path
+    .join(os.homedir(), '.opensrc')
+    .replaceAll('\\', '/')
   const kimakiDataDir = path
     .join(os.homedir(), '.kimaki')
     .replaceAll('\\', '/')
@@ -503,6 +589,8 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
     [`${tmpdir}/*`]: 'allow',
     [opencodeConfigDir]: 'allow',
     [`${opencodeConfigDir}/*`]: 'allow',
+    [opensrcDir]: 'allow',
+    [`${opensrcDir}/*`]: 'allow',
     [kimakiDataDir]: 'allow',
     [`${kimakiDataDir}/*`]: 'allow',
   }
@@ -528,7 +616,7 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
       return {}
     }
     const root = path.join(getDataDir(), 'opencode-vitest-home')
-    return {
+    const directories = {
       OPENCODE_TEST_HOME: root,
       OPENCODE_CONFIG_DIR: path.join(root, '.opencode-kimaki'),
       XDG_CONFIG_HOME: path.join(root, '.config'),
@@ -536,6 +624,13 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
       XDG_CACHE_HOME: path.join(root, '.cache'),
       XDG_STATE_HOME: path.join(root, '.local', 'state'),
     }
+    // OpenCode writes state/config files into these XDG locations during boot.
+    // In CI, a fresh temp data dir means the parent folders may not exist yet,
+    // and some writes fail closed with NotFound before OpenCode has a chance to
+    // create them lazily. Pre-create the directories so startup-time tests do
+    // not flap based on process scheduling.
+    ensureOpencodeHomeDirectories({ directories })
+    return directories
   })()
 
   // Write config to a file instead of passing via OPENCODE_CONFIG_CONTENT env var.
@@ -543,16 +638,30 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
   // priority chain, so project-level opencode.json can override kimaki defaults.
   // OPENCODE_CONFIG_CONTENT was loaded last and overrode user project configs,
   // causing issue #90 (project permissions not being respected).
+  const isDev = import.meta.url.endsWith('.ts') || import.meta.url.endsWith('.tsx')
+  // Skill whitelist/blacklist from --enable-skill / --disable-skill CLI flags.
+  // Applied as opencode permission.skill rules so every agent inherits the
+  // filter via Permission.merge(defaults, agentRules, user).
+  const skillPermission = computeSkillPermission({
+    enabledSkills: store.getState().enabledSkills,
+    disabledSkills: store.getState().disabledSkills,
+  })
   const opencodeConfig = {
     $schema: 'https://opencode.ai/config.json',
     lsp: false,
     formatter: false,
-    plugin: [new URL('../src/kimaki-opencode-plugin.ts', import.meta.url).href],
+    plugin: [
+      new URL(
+        isDev ? './kimaki-opencode-plugin.ts' : './kimaki-opencode-plugin.js',
+        import.meta.url,
+      ).href,
+    ],
     permission: {
       edit: 'allow',
       bash: 'allow',
       external_directory: externalDirectoryPermissions,
       webfetch: 'allow',
+      ...(skillPermission && { skill: skillPermission }),
     },
     agent: {
       explore: {
@@ -633,37 +742,27 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
     `Spawned opencode serve --port ${port} (pid: ${serverProcess.pid})`,
   )
 
-  serverProcess.stdout?.on('data', (data) => {
-    try {
-      const chunk = data.toString()
-      const lines = splitOutputChunkLines(chunk)
+  const stdoutReader = subscribeToProcessLogStream({
+    stream: serverProcess.stdout,
+    onLine: (line) => {
       if (!serverReady) {
-        logBuffer.push(...lines.map((line) => `[stdout] ${line}`))
+        logBuffer.push(`[stdout] ${line}`)
         return
       }
-      for (const line of lines) {
-        opencodeLogger.log(line)
-      }
-    } catch (error) {
-      logBuffer.push(`Failed to process stdout startup logs: ${error}`)
-    }
+      opencodeLogger.log(line)
+    },
   })
 
-  serverProcess.stderr?.on('data', (data) => {
-    try {
-      const chunk = data.toString()
-      const lines = splitOutputChunkLines(chunk)
+  const stderrReader = subscribeToProcessLogStream({
+    stream: serverProcess.stderr,
+    onLine: (line) => {
       if (!serverReady) {
-        logBuffer.push(...lines.map((line) => `[stderr] ${line}`))
-        pushStartupStderrTail({ stderrTail: startupStderrTail, chunk })
+        logBuffer.push(`[stderr] ${line}`)
+        pushStartupStderrTail({ stderrTail: startupStderrTail, line })
         return
       }
-      for (const line of lines) {
-        opencodeLogger.error(line)
-      }
-    } catch (error) {
-      logBuffer.push(`Failed to process stderr startup logs: ${error}`)
-    }
+      opencodeLogger.error(line)
+    },
   })
 
   serverProcess.on('error', (error) => {
@@ -671,6 +770,9 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
   })
 
   serverProcess.on('exit', (code, signal) => {
+    stdoutReader?.close()
+    stderrReader?.close()
+
     if (startingServerProcess === serverProcess) {
       startingServerProcess = null
     }
@@ -719,6 +821,7 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
 
   const waitResult = await waitForServer({
     port,
+    directory,
     startupStderrTail,
   })
   if (waitResult instanceof Error) {
@@ -755,9 +858,6 @@ async function startSingleServer(): Promise<ServerStartError | SingleServer> {
   notifyServerLifecycle({ type: 'started', port })
   return server
 }
-
-// ── Client cache ─────────────────────────────────────────────────
-// One SDK client per directory, each with a fixed x-opencode-directory header.
 
 function getOrCreateClient({
   baseUrl,
@@ -814,7 +914,9 @@ export async function initializeOpencodeForDirectory(
     return accessCheck
   }
 
-  const server = await ensureSingleServer()
+  preferredStartupDirectory = directory
+
+  const server = await ensureSingleServer({ directory })
   if (server instanceof Error) {
     return server
   }
@@ -867,54 +969,93 @@ export function buildSessionPermissions({
     { permission: 'external_directory', pattern: `${normalizedDirectory}/*`, action: 'allow' },
   ]
 
+  const homeDirectoryRules = ({ relativePath }: { relativePath: string }) => {
+    const normalizedRelativePath = relativePath.replaceAll('\\', '/')
+    const basePattern = path.resolve(os.homedir(), normalizedRelativePath)
+    return [
+      { permission: 'external_directory', pattern: basePattern, action: 'allow' },
+      { permission: 'external_directory', pattern: `${basePattern}/*`, action: 'allow' },
+    ] satisfies PermissionRuleset
+  }
+
   // Allow ~/.config/opencode so the agent doesn't get permission prompts when
   // it tries to read the global AGENTS.md or opencode config (the path is
   // visible in the system prompt, so models sometimes try to read it).
-  const opencodeConfigDir = path
-    .join(os.homedir(), '.config', 'opencode')
-    .replaceAll('\\', '/')
-  rules.push(
-    { permission: 'external_directory', pattern: opencodeConfigDir, action: 'allow' },
-    { permission: 'external_directory', pattern: `${opencodeConfigDir}/*`, action: 'allow' },
-  )
+  rules.push(...homeDirectoryRules({ relativePath: '.config/opencode' }))
+
+  // Allow ~/.config/openc0de too because the Anthropic plugin rewrites the
+  // name in the system prompt and some models may try to inspect that path.
+  rules.push(...homeDirectoryRules({ relativePath: '.config/openc0de' }))
+
+  // Allow ~/.opensrc so agents can inspect cached opensrc checkouts without
+  // permission prompts.
+  rules.push(...homeDirectoryRules({ relativePath: '.opensrc' }))
 
   // Allow ~/.kimaki so the agent can access kimaki data dir (logs, db, etc.)
   // without permission prompts.
-  const kimakiDataDir = path
-    .join(os.homedir(), '.kimaki')
-    .replaceAll('\\', '/')
-  rules.push(
-    { permission: 'external_directory', pattern: kimakiDataDir, action: 'allow' },
-    { permission: 'external_directory', pattern: `${kimakiDataDir}/*`, action: 'allow' },
-  )
+  rules.push(...homeDirectoryRules({ relativePath: '.kimaki' }))
 
   // Allow opencode tool output artifacts under XDG data so agents can inspect
   // prior tool outputs without interactive permission prompts.
-  const opencodeToolOutputDir = path
-    .join(os.homedir(), '.local', 'share', 'opencode', 'tool-output')
-    .replaceAll('\\', '/')
+  rules.push(...homeDirectoryRules({ relativePath: '.local/share/opencode/tool-output' }))
+
+  // Allow common language caches under the user's home directory so toolchains
+  // can inspect downloaded modules and artifacts without external_directory prompts.
   rules.push(
-    {
-      permission: 'external_directory',
-      pattern: opencodeToolOutputDir,
-      action: 'allow',
-    },
-    {
-      permission: 'external_directory',
-      pattern: `${opencodeToolOutputDir}/*`,
-      action: 'allow',
-    },
+    ...homeDirectoryRules({ relativePath: '.cache/zig' }),
+    ...homeDirectoryRules({ relativePath: '.cargo' }),
+    ...homeDirectoryRules({ relativePath: '.cache/go-build' }),
+    ...homeDirectoryRules({ relativePath: 'go/pkg' }),
   )
 
-  // For worktrees: allow access to the original repository directory
-  if (originalRepo) {
+  // For worktree sessions: explicitly deny the original checkout so agents do
+  // not keep editing the main repo after the thread has moved to a managed
+  // worktree. Deny rules are appended last so they override earlier allow/
+  // ask defaults via opencode's findLast() evaluation.
+  if (originalRepo && originalRepo !== normalizedDirectory) {
     rules.push(
-      { permission: 'external_directory', pattern: originalRepo, action: 'allow' },
-      { permission: 'external_directory', pattern: `${originalRepo}/*`, action: 'allow' },
+      ...buildExternalDirectoryPermissionRules({
+        resolvedPattern: originalRepo,
+        action: 'deny',
+      }),
     )
   }
 
+
   return rules
+}
+
+const ALL_EXTERNAL_DIRECTORIES_PATTERN = '*'
+
+export function buildExternalDirectoryPermissionRules({
+  resolvedPattern,
+  action,
+}: {
+  resolvedPattern: string
+  action: 'allow' | 'deny' | 'ask'
+}): PermissionRuleset {
+  if (resolvedPattern === ALL_EXTERNAL_DIRECTORIES_PATTERN) {
+    return [
+      {
+        permission: 'external_directory',
+        pattern: ALL_EXTERNAL_DIRECTORIES_PATTERN,
+        action,
+      },
+    ]
+  }
+
+  return [
+    {
+      permission: 'external_directory',
+      pattern: resolvedPattern,
+      action,
+    },
+    {
+      permission: 'external_directory',
+      pattern: `${resolvedPattern}/*`,
+      action,
+    },
+  ]
 }
 
 /**
@@ -1091,7 +1232,6 @@ export async function stopOpencodeServer(): Promise<boolean> {
 /**
  * Restart the single opencode server.
  * Kills the existing process and starts a new one.
- * All directory clients are invalidated and recreated on next use.
  * Used for resolving opencode state issues, refreshing auth, plugins, etc.
  */
 export async function restartOpencodeServer(): Promise<OpenCodeErrors | true> {

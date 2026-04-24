@@ -1,5 +1,141 @@
 # Changelog
 
+## 0.7.0
+
+1. **New `/fork-subagent` command** — fork an active subagent task session into its own Discord thread. Shows a dropdown of running subagent tasks with their prompt previews. The new thread inherits the full session context (memory, tool outputs, event history) so you can continue the subagent's work independently:
+
+   ```text
+   /fork-subagent
+   ```
+
+2. **Callout containers in Discord** — the bot now renders accent-colored callout blocks (warnings, tips, action-required notes) as Discord Components V2 containers. Callouts can recursively include tables and action buttons, making structured responses easier to scan. The system prompt includes color-coded callout types: orange for warnings, blue for TODOs, red for tool failures, purple for gist summaries.
+
+3. **`/add-dir` directory option now optional** — omit the directory argument to default to `*` (all directories) for the current session. Explicit paths are still resolved against the active worktree when provided:
+
+   ```text
+   # Allow all directories (no argument needed)
+   /add-dir
+
+   # Allow a specific directory (still works)
+   /add-dir ../shared-data
+   ```
+
+4. **Fix: Anthropic plugin per-session directory resolution** — the Anthropic auth plugin now extracts the per-session working directory from the OpenCode identity block instead of using the server's cwd. Fixes incorrect file paths in multi-session and worktree setups.
+
+5. **Fix: faster startup when replacing a running instance** — the Hrana database server now polls the old process every second during eviction instead of sleeping a fixed 6 seconds. Startup is faster when the old instance shuts down promptly while still allowing graceful cleanup.
+
+## 0.6.0
+
+1. **Subagent rate-limit handling** — when a task-created child session hits a provider rate limit (HTTP 429), kimaki now automatically aborts the subagent session instead of letting the error cascade to the parent. The parent task session recovers on its own, keeping rate-limit noise out of your Discord threads.
+
+2. **Bash tool for the voice assistant** — the GenAI worker now includes a shell execution tool that can run commands in the project directory. It also supports remote skill loading: skill SKILL.md files fetched from URLs are cached locally and their metadata is injected into the tool description so the model can discover specialized workflows.
+
+3. **Common toolchain caches pre-allowed** — zig, cargo, go build, and go pkg cache directories under `~` are now pre-allowed as external directories. Agents using these toolchains no longer trigger permission prompts for inspecting downloaded modules and build artifacts.
+
+4. **Fixed infinite abort-replay loop on large contexts** — when the LLM took >3 seconds to return the first token (e.g. 239K token prompts), the interrupt plugin would abort and replay the message in a tight loop every 3 seconds. Replayed message IDs are now tracked to break the cycle.
+
+5. **Fixed unscoped Discord toasts** — global plugin toasts without a session-scoped marker were being forwarded into unrelated Discord threads. Toasts are now only rendered when they carry a session ID, preventing rate-limit and status toasts from spamming conversations.
+
+6. **Fixed Anthropic OAuth identity in system prompt** — the Anthropic auth plugin now correctly rebrands the openc0de identity and allows `~/.config/openc0de` as a valid config directory, fixing repeated auth failures.
+
+7. **Fixed home directory resolution bug** — corrected path resolution for the user's home directory in opencode startup.
+
+## 0.5.0
+
+1. **New `/add-dir` Discord command** — expand the current session's directory access permissions without restarting. In a thread with an active session, run `/add-dir <path>` to grant the AI access to a specific external directory, or `/add-dir *` to allow all directories:
+   ```text
+   /add-dir ../other-project
+   /add-dir /tmp/shared-data
+   /add-dir *
+   ```
+
+2. **Worktree sessions can no longer edit the main checkout** — when a thread moves into a git worktree, existing and newly created sessions automatically deny write access to the original repo path. This prevents the agent from accidentally modifying the main branch while working in a worktree.
+
+3. **System prompt drift notices show inline diff snippets** — the "Context cache discarded" toast now includes a short markdown diff snippet directly in Discord, instead of writing a debug file to disk. Makes it immediately visible which parts of the system prompt changed.
+
+4. **`kimaki tunnel` now injects `TRAFORO_URL` into the child process** — apps launched through `kimaki tunnel` can read `process.env.TRAFORO_URL` to wire OAuth callbacks, webhook URLs, and absolute links to the public tunnel instead of localhost:
+   ```bash
+   kimaki tunnel -- sh -c 'BETTER_AUTH_URL=$TRAFORO_URL exec pnpm dev'
+   ```
+
+5. **Fixed OpenCode directory resolution for worktree sessions** — agent, model, provider, and config calls now pass the worktree-aware directory instead of the client default, so worktree sessions resolve against the active checkout correctly.
+
+6. **Fixed OpenCode log chunking** — stderr/stdout from the opencode server process is now read line-by-line instead of splitting raw chunks, preventing garbled or merged log lines.
+
+## 0.4.104
+
+1. **Queued messages now keep moving while question dropdowns are open** — if the assistant asks a dropdown question and you queue a follow-up message, kimaki now hands off the first queued item immediately instead of waiting for the dropdown to be answered. This keeps the visible `» user:` dispatch indicator moving and prevents queued work from feeling stuck behind interactive prompts.
+
+## 0.4.103
+
+1. **`btw` message shortcut for side-question forks** — type `btw fix the auth bug` directly in a thread to fork the session with full context, without using the `/btw` slash command. Supports punctuation separators like `btw. check this`, `btw, why is this broken`, `btw: look at that`. Thread titles preserve the `btw:` and `Fork:` prefixes when OpenCode renames them.
+
+2. **`--enable-skill` / `--disable-skill` flags** — control which bundled skills get injected into the model's system prompt:
+   ```bash
+   # only load specific skills
+   kimaki --enable-skill drizzle --enable-skill errore
+
+   # hide noisy skills
+   kimaki --disable-skill jitter --disable-skill termcast
+   ```
+   Flags are mutually exclusive (whitelist vs blacklist) and repeatable.
+
+3. **`/worktrees` now shows all worktrees, not just kimaki-created ones** — uses `git worktree list` as source of truth, enriched with DB metadata (thread links, timestamps). Surfaces kimaki-created, opencode-created, and manually created worktrees in a single table with a Source column.
+
+4. **Shorter worktree folder names** — worktrees now live under `<dataDir>/worktrees/<hash>/<basename>` instead of the deeply nested opencode paths with `opencode-kimaki-` prefix. Shorter paths make the agent less likely to accidentally operate on the wrong worktree.
+
+5. **`kimaki anthropic current-account`** — prints the currently active Anthropic OAuth account email for quick inspection.
+
+6. **Fixed Anthropic system prompt losing working directory** — `sanitizeAnthropicSystemText` was stripping the OpenCode identity block which contains environment context (cwd, OS). The model now retains awareness of the current working directory after the Anthropic rewrite.
+
+7. **Fixed duplicate question dropdowns** — repeated `AskUserQuestion` tool requests no longer produce duplicate Discord select menus. Stale contexts are cleaned up on answer, cancel, or expiry.
+
+8. **Fixed queue drain dumping all messages at once** — answering a dropdown question no longer flushes every locally queued message into OpenCode simultaneously. Only the next queued message is dispatched, preserving normal one-by-one Discord indicators.
+
+9. **Fixed duplicate task start messages** — repeated tool updates for the same part no longer post the same Discord line twice.
+
+10. **Skills from `~/.config/opencode/skills/` now load correctly** — fixed path resolution for user-installed skills outside the bundled skills directory.
+
+## 0.4.102
+
+1. **Fixed OpenCode plugin failing to load in the published npm package** — kimaki now loads `dist/kimaki-opencode-plugin.js` in published builds instead of the TypeScript source entrypoint, which imported `.js` sibling files that don't exist under `src/` in the npm tarball. Users running kimaki under PM2 or npx saw `ERR_MODULE_NOT_FOUND: Cannot find module 'ipc-tools-plugin.js'` on startup; this is now fixed.
+
+2. **`~/.opensrc` is now pre-allowed in OpenCode permissions** — agents can inspect cached opensrc package checkouts without triggering interactive permission prompts.
+
+## 0.4.101
+
+1. **Claude Max login works again when Anthropic shows the new third-party app billing prompt** — kimaki now rewrites Anthropic's transformed system prompt in the hook Anthropic actually reads, so OAuth login keeps working when Claude shows messages like "Third-party apps now draw from your extra usage" instead of silently falling back to a broken prompt state.
+
+2. **`MEMORY.md` heading overview is now frozen per session** — kimaki snapshots the condensed `MEMORY.md` table of contents on the first real user message and reuses that same overview for the rest of the session. Editing `MEMORY.md` mid-session no longer mutates the active system prompt or invalidates the session cache; starting a new session still picks up the latest headings.
+
+3. **`/login` now surfaces `opencode` and `opencode-go` providers** — the provider picker prioritizes both entries so they are easier to find when signing in through Discord:
+   ```text
+   /login
+   ```
+
+## 0.4.100
+
+1. **`/vscode` now opens reliably through the Kimaki tunnel** — the browser editor no longer depends on Coderaft's `?tkn=` connection-token redirect flow, which could fail and return `Forbidden` after passing through the public tunnel. Kimaki now launches Coderaft without a connection token and returns the unique tunnel URL directly:
+   ```text
+   /vscode
+   ```
+   The session still auto-stops after 30 minutes, and the generated tunnel host remains high-entropy and hard to guess.
+
+## 0.4.99
+
+1. **Existing gateway installs now auto-migrate to `kimaki.dev`** — on startup, kimaki rewrites saved gateway proxy URLs from `discord-gateway.kimaki.xyz` to `discord-gateway.kimaki.dev` in local SQLite for gateway mode. This prevents legacy endpoint drift that could cause Discord interactions to time out with "application did not respond".
+
+## 0.4.98
+
+1. **New `/vscode` Discord command** — open the current project or worktree in browser VS Code (Coderaft) through a private tunnel, with automatic 30-minute shutdown. This is useful for quick remote edits without leaving Discord:
+   ```text
+   /vscode
+   ```
+
+2. **`kimaki.dev` is now the default domain for new sessions and links** — default onboarding website URL, gateway proxy URL, and tunnel-based features now point to `kimaki.dev`. Existing `kimaki.xyz` routes remain supported during migration.
+
+3. **System prompt drift notices are less noisy** — drift detection now waits until system-transform hooks finish mutating the prompt before comparing turns, reducing false positives in "Context cache discarded" toasts.
+
 ## 0.4.97
 
 1. **Anthropic account CLI commands are now visible in help** — `kimaki anthropic account list/add/remove` commands appear in normal `--help` output. `remove` now accepts either a 1-based index or a stored email address for easier cleanup.

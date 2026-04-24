@@ -34,12 +34,13 @@ export const VOICE_MESSAGE_TRANSCRIPTION_PREFIX =
 /** Fetch available agents from OpenCode for voice transcription agent selection. */
 async function fetchAvailableAgents(
   getClient: Awaited<ReturnType<typeof initializeOpencodeForDirectory>>,
+  directory: string,
 ): Promise<AgentInfo[]> {
   if (getClient instanceof Error) {
     return []
   }
   const result = await errore.tryAsync(() => {
-    return getClient().app.agents({})
+    return getClient().app.agents({ directory })
   })
   if (result instanceof Error) {
     return []
@@ -55,12 +56,13 @@ async function fetchAvailableAgents(
 
 export type { PreprocessResult }
 
-// Matches punctuation + "queue" at the end of a message (case-insensitive).
-// Supports any common punctuation before "queue" (. ! ? , ; :) and an optional
-// trailing period: ". queue", "! queue", ". queue.", "!queue." etc.
+// Matches explicit queue markers at the end of a message (case-insensitive).
+// Supported forms:
+// - punctuation + queue: ". queue", "! queue", ". queue.", "!queue."
+// - queue as its own final line: "text\nqueue" or just "queue"
 // When present the suffix is stripped and the message is routed through
 // kimaki's local queue (same as /queue command).
-const QUEUE_SUFFIX_RE = /[.!?,;:]\s*queue\.?\s*$/i
+const QUEUE_SUFFIX_RE = /(?:[.!?,;:]|^)\s*queue\.?\s*$|\n\s*queue\.?\s*$/i
 const REPLIED_MESSAGE_TEXT_LIMIT = 1_000
 
 function extractQueueSuffix(prompt: string): { prompt: string; forceQueue: boolean } {
@@ -211,7 +213,7 @@ export async function preprocessExistingThreadMessage({
           client,
           excludeSessionId: sessionId,
         }),
-        fetchAvailableAgents(getClient),
+        fetchAvailableAgents(getClient, projectDirectory),
       ])
 
       if (errore.isOk(sessionContextResult)) {
@@ -312,7 +314,7 @@ export async function preprocessNewSessionMessage({
   if (hasVoiceAttachment && projectDirectory) {
     try {
       const getClient = await initializeOpencodeForDirectory(projectDirectory)
-      agents = await fetchAvailableAgents(getClient)
+      agents = await fetchAvailableAgents(getClient, projectDirectory)
     } catch (e) {
       voiceLogger.error(`Could not fetch agents for voice transcription:`, e)
     }
@@ -399,7 +401,7 @@ export async function preprocessNewThreadMessage({
   if (hasVoiceAttachment && projectDirectory) {
     try {
       const getClient = await initializeOpencodeForDirectory(projectDirectory)
-      agents = await fetchAvailableAgents(getClient)
+      agents = await fetchAvailableAgents(getClient, projectDirectory)
     } catch (e) {
       voiceLogger.error(`Could not fetch agents for voice transcription:`, e)
     }

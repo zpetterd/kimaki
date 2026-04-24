@@ -5,12 +5,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { Message as OpenCodeMessage } from '@opencode-ai/sdk/v2'
 import { describe, expect, test } from 'vitest'
-import {
-  getOpencodeEventSessionId,
-  type OpencodeEventLogEntry,
-} from './opencode-session-event-log.js'
+import { type OpencodeEventLogEntry } from './opencode-session-event-log.js'
 import {
   getAssistantMessageIdsForLatestUserTurn,
+  getDerivedSubagentSessions,
+  getEventBufferSessionId,
   getCurrentTurnStartTime,
   getDerivedSubtaskIndex,
   getLatestAssistantMessageIdForLatestUserTurn,
@@ -39,7 +38,7 @@ function loadFixture(filename: string): EventBufferEntry[] {
 
 function getSessionId(events: EventBufferEntry[]): string {
   for (const entry of events) {
-    const sessionId = getOpencodeEventSessionId(entry.event)
+    const sessionId = getEventBufferSessionId(entry.event)
     if (sessionId) {
       return sessionId
     }
@@ -559,6 +558,79 @@ describe('real-session-task-user-interruption', () => {
       mainSessionId: sessionId,
       candidateSessionId: 'ses_nonexistent',
     })).toBe(undefined)
+  })
+
+  test('getDerivedSubagentSessions returns latest tasks first with agent labels', () => {
+    const firstTaskEvent = events.find((entry) => {
+      if (entry.event.type !== 'message.part.updated') {
+        return false
+      }
+      const part = entry.event.properties.part
+      if (part.sessionID !== sessionId) {
+        return false
+      }
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        return false
+      }
+      return part.state.status === 'running' || part.state.status === 'completed'
+    })
+    if (!firstTaskEvent || firstTaskEvent.event.type !== 'message.part.updated') {
+      throw new Error('Expected to find task tool event in fixture')
+    }
+
+    const newerTaskEvent = structuredClone(firstTaskEvent)
+    if (newerTaskEvent.event.type !== 'message.part.updated') {
+      throw new Error('Expected message.part.updated event')
+    }
+    const newerTaskPart = newerTaskEvent.event.properties.part
+    if (newerTaskPart.type !== 'tool' || newerTaskPart.tool !== 'task') {
+      throw new Error('Expected task tool part')
+    }
+    if (newerTaskPart.state.status !== 'running' && newerTaskPart.state.status !== 'completed') {
+      throw new Error('Expected running or completed task tool part')
+    }
+    newerTaskPart.id = `${newerTaskPart.id}-newer`
+    newerTaskPart.state = {
+      ...newerTaskPart.state,
+      input: {
+        ...newerTaskPart.state.input,
+        description: 'inspect recent task output',
+        subagent_type: 'explore',
+      },
+      metadata: {
+        ...(newerTaskPart.state.metadata || {}),
+        sessionId: 'ses_newer_child',
+      },
+    }
+
+    const latestTimestamp = events[events.length - 1]?.timestamp || 0
+    const augmentedEvents: EventBufferEntry[] = [
+      ...events,
+      {
+        timestamp: latestTimestamp + 1,
+        event: newerTaskEvent.event,
+      },
+    ]
+
+    expect(getDerivedSubagentSessions({
+      events: augmentedEvents,
+      mainSessionId: sessionId,
+    })).toMatchInlineSnapshot(`
+      [
+        {
+          "childSessionId": "ses_newer_child",
+          "description": "inspect recent task output",
+          "subagentType": "explore",
+          "timestamp": 1772641957983,
+        },
+        {
+          "childSessionId": "ses_3464f3a1dffeBBD0d15EqnGjAh",
+          "description": undefined,
+          "subagentType": undefined,
+          "timestamp": 1772641955371,
+        },
+      ]
+    `)
   })
 })
 
