@@ -2670,15 +2670,21 @@ export class ThreadSessionRuntime {
     questionRequest: QuestionRequest,
   ): Promise<void> {
     const sessionId = this.state?.sessionId
-    if (questionRequest.sessionID !== sessionId) {
+    const subtaskInfo = this.getSubtaskInfoForSession(questionRequest.sessionID)
+    const isMainSession = questionRequest.sessionID === sessionId
+    const isSubtaskSession = Boolean(subtaskInfo)
+
+    if (!isMainSession && !isSubtaskSession) {
       logger.log(
-        `[QUESTION IGNORED] Question for different session (expected: ${sessionId}, got: ${questionRequest.sessionID})`,
+        `[QUESTION IGNORED] Question for unknown session (expected: ${sessionId} or subtask, got: ${questionRequest.sessionID})`,
       )
       return
     }
 
+    const subtaskLabel = subtaskInfo?.label
+
     logger.log(
-      `Question requested: id=${questionRequest.id}, questions=${questionRequest.questions.length}`,
+      `Question requested: id=${questionRequest.id}, questions=${questionRequest.questions.length}${subtaskLabel ? `, subtask=${subtaskLabel}` : ''}`,
     )
 
     await this.showInteractiveUi({
@@ -2705,7 +2711,11 @@ export class ThreadSessionRuntime {
 
   private handleQuestionReplied(properties: { sessionID: string }): void {
     const sessionId = this.state?.sessionId
-    if (properties.sessionID !== sessionId) {
+    const subtaskInfo = this.getSubtaskInfoForSession(properties.sessionID)
+    const isMainSession = properties.sessionID === sessionId
+    const isSubtaskSession = Boolean(subtaskInfo)
+
+    if (!isMainSession && !isSubtaskSession) {
       return
     }
     this.onInteractiveUiStateChanged()
@@ -2716,7 +2726,7 @@ export class ThreadSessionRuntime {
     // resumes, but keep later items local so their `» user:` indicators still
     // appear one-by-one when they actually become active.
     this.maybeHandoffQueuedItemForPendingQuestion({
-      sessionId,
+      sessionId: sessionId ?? properties.sessionID,
       reason: 'question-replied',
     })
   }
