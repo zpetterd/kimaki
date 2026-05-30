@@ -6,10 +6,12 @@
 // call runtime APIs (enqueueIncoming, abortActiveRun, etc.) without inspecting
 // run internals.
 
+import crypto from 'node:crypto'
 import { ChannelType, type ThreadChannel } from 'discord.js'
 import type {
   Event as OpenCodeEvent,
   Part,
+  PermissionRuleset,
   PermissionRequest,
   QuestionRequest,
   Message as OpenCodeMessage,
@@ -27,6 +29,7 @@ import {
   parsePermissionRules,
   subscribeOpencodeServerLifecycle,
   writeInjectionGuardConfig,
+  extractSdkErrorMessage,
 } from '../opencode.js'
 import { isAbortError } from '../utils.js'
 import { createLogger, LogPrefix } from '../logger.js'
@@ -40,17 +43,20 @@ import { formatPart } from '../message-formatting.js'
 import {
   getChannelVerbosity,
   getPartMessageIds,
-  getPrisma,
+  getDb,
   setPartMessage,
   getThreadSession,
   setThreadSession,
   getThreadWorktree,
   setSessionAgent,
+  clearSessionModel,
   getVariantCascade,
   setSessionStartSource,
   appendSessionEventsSinceLastTimestamp,
   getSessionEventSnapshot,
 } from '../database.js'
+import * as orm from 'drizzle-orm'
+import * as schema from '../schema.js'
 import {
   showPermissionButtons,
   addPermissionRequestToContext,
@@ -512,6 +518,7 @@ export type PreprocessResult = {
   prompt: string
   images?: DiscordFileAttachment[]
   repliedMessage?: RepliedMessageContext
+  permissionRules?: PermissionRuleset
   /** Resolved mode based on voice transcription result. */
   mode: 'opencode' | 'local-queue'
   /** When true, preprocessing determined the message should be silently dropped. */
@@ -554,6 +561,7 @@ export type IngressInput = {
    * session creation (first dispatch).
    */
   permissions?: string[]
+  permissionRules?: PermissionRuleset
   injectionGuardPatterns?: string[]
   sessionStartSource?: { scheduleKind: 'at' | 'cron'; scheduledTaskId?: number }
   /** Optional guard for retries: skip enqueue when session has changed. */
@@ -889,7 +897,7 @@ export class ThreadSessionRuntime {
         {
           session_id: sessionId,
           thread_id: this.threadId,
-          timestamp: BigInt(entry.timestamp),
+          timestamp: entry.timestamp,
           event_index: entry.eventIndex || 0,
           event_json: JSON.stringify(entry.event),
         },
@@ -1274,6 +1282,7 @@ export class ThreadSessionRuntime {
   // they only stabilize event-derived busy/idle gating for local queue drains.
   private markQueueDispatchBusy(sessionId: string): void {
     this.appendEventToBuffer({
+      id: `synthetic-${crypto.randomUUID()}`,
       type: 'session.status',
       properties: {
         sessionID: sessionId,
@@ -1284,6 +1293,7 @@ export class ThreadSessionRuntime {
 
   private markQueueDispatchIdle(sessionId: string): void {
     this.appendEventToBuffer({
+      id: `synthetic-${crypto.randomUUID()}`,
       type: 'session.idle',
       properties: {
         sessionID: sessionId,
@@ -1412,8 +1422,6 @@ export class ThreadSessionRuntime {
         continue
       }
 
-      // Reset backoff on successful connection
-      backoffMs = 500
       const events = subscribeResult.stream
 
       logger.log(
@@ -1424,8 +1432,10 @@ export class ThreadSessionRuntime {
       // parts that arrived while we were disconnected.
       await this.bootstrapSentPartIds()
 
+      let receivedAnyEvent = false
       const iterResult = await errore.tryAsync(async () => {
         for await (const event of events) {
+          receivedAnyEvent = true
           // Each event is dispatched through the serialized action queue
           // to prevent interleaving mutations from concurrent events.
           await this.dispatchAction(() => {
@@ -1433,6 +1443,14 @@ export class ThreadSessionRuntime {
           })
         }
       })
+
+      // Only reset backoff when the stream was alive long enough to
+      // deliver at least one event. If it closes immediately the server
+      // is likely not ready; keep escalating backoff to avoid a tight
+      // reconnect loop (GitHub issue #126).
+      if (receivedAnyEvent) {
+        backoffMs = 500
+      }
 
       if (iterResult instanceof Error) {
         if (isAbortError(iterResult)) {
@@ -1442,6 +1460,17 @@ export class ThreadSessionRuntime {
         logger.warn(
           `[LISTENER] Stream broke for thread ${this.threadId}, reconnecting in ${backoffMs}ms:`,
           iterError.message,
+        )
+        await delay(backoffMs)
+        backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
+      } else {
+        // Stream completed normally (server closed the connection).
+        // This can happen when the opencode server restarts, the SSE
+        // endpoint times out, or there are no active sessions for this
+        // directory. Without a delay here the loop reconnects immediately,
+        // creating a tight infinite reconnect loop (GitHub issue #126).
+        logger.log(
+          `[LISTENER] Stream ended normally for thread ${this.threadId}, reconnecting in ${backoffMs}ms`,
         )
         await delay(backoffMs)
         backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
@@ -1873,7 +1902,7 @@ export class ThreadSessionRuntime {
       )
       return
     }
-    await setPartMessage(part.id, sendResult.id, this.thread.id)
+    await setPartMessage({ partId: part.id, messageId: sendResult.id, threadId: this.thread.id })
     if (repulseTyping) {
       this.requestTypingRepulse()
     }
@@ -2206,7 +2235,7 @@ export class ThreadSessionRuntime {
               )
               return
             }
-            await setPartMessage(part.id, sendResult.id, this.thread.id)
+            await setPartMessage({ partId: part.id, messageId: sendResult.id, threadId: this.thread.id })
           }
         }
       }
@@ -2404,7 +2433,7 @@ export class ThreadSessionRuntime {
       newIds.add(part.id)
       return { ...t, sentPartIds: newIds }
     })
-    await setPartMessage(part.id, sendResult.id, this.thread.id)
+    await setPartMessage({ partId: part.id, messageId: sendResult.id, threadId: this.thread.id })
     this.requestTypingRepulse()
   }
 
@@ -2520,7 +2549,9 @@ export class ThreadSessionRuntime {
       return
     }
 
-    const errorMessage = formatSessionErrorFromProps(properties.error)
+    const errorMessage = truncateSessionErrorMessage(
+      formatSessionErrorFromProps(properties.error),
+    )
     logger.error(`Sending error to thread: ${errorMessage}`)
     await sendThreadMessage(
       this.thread,
@@ -2950,22 +2981,20 @@ export class ThreadSessionRuntime {
   }
 
   private async loadLastSyncedThreadName() {
-    const prisma = await getPrisma()
-    const row = await prisma.thread_sessions.findUnique({
+    const db = await getDb()
+    const row = await db.query.thread_sessions.findFirst({
       where: { thread_id: this.threadId },
-      select: { last_synced_name: true },
+      columns: { last_synced_name: true },
     })
     return row?.last_synced_name ?? null
   }
 
   private async persistLastSyncedThreadName(name: string): Promise<void> {
     this.lastSyncedThreadName = name
-    const prisma = await getPrisma()
-    const result = await prisma.thread_sessions
-      .update({
-        where: { thread_id: this.threadId },
-        data: { last_synced_name: name },
-      })
+    const db = await getDb()
+    const result = await db.update(schema.thread_sessions)
+      .set({ last_synced_name: name })
+      .where(orm.eq(schema.thread_sessions.thread_id, this.threadId))
       .catch(
         (e) =>
           new Error('Failed to persist thread rename state', {
@@ -3045,6 +3074,7 @@ export class ThreadSessionRuntime {
         prompt: input.prompt,
         agent: input.agent,
         permissions: input.permissions,
+        permissionRules: input.permissionRules,
         injectionGuardPatterns: input.injectionGuardPatterns,
         sessionStartScheduleKind: input.sessionStartSource?.scheduleKind,
         sessionStartScheduledTaskId: input.sessionStartSource?.scheduledTaskId,
@@ -3055,6 +3085,18 @@ export class ThreadSessionRuntime {
       }
 
       const { session, getClient, createdNewSession } = sessionResult
+
+      const updatePermissionsResult = await this.updateExistingSessionPermissions({
+        client: getClient(),
+        sessionId: session.id,
+        createdNewSession,
+        permissions: input.permissions,
+        permissionRules: input.permissionRules,
+      })
+      if (updatePermissionsResult instanceof Error) {
+        await cleanupOnError(`Failed to update session permissions: ${updatePermissionsResult.message}`)
+        return
+      }
 
       // If listener startup happened before initializeOpencodeForDirectory(),
       // startEventListener may have exited early with "No OpenCode client".
@@ -3068,8 +3110,12 @@ export class ThreadSessionRuntime {
       const channelId = this.channelId
       const resolvedAppId = input.appId
 
-      if (input.agent && createdNewSession) {
+      // Explicit agent prompts (for example /plan-agent <prompt>) must update
+      // the session preference before dispatch. Otherwise the model can resolve
+      // from the requested agent while OpenCode keeps running the old agent.
+      if (input.agent) {
         await setSessionAgent(session.id, input.agent)
+        await clearSessionModel(session.id)
       }
 
       await ensureSessionPreferencesSnapshot({
@@ -3256,30 +3302,9 @@ export class ThreadSessionRuntime {
         return getClient().session.promptAsync(request)
       })
       if (promptResult instanceof Error || promptResult.error) {
-        const errorMessage = (() => {
-          if (promptResult instanceof Error) {
-            return promptResult.message
-          }
-          const err = promptResult.error
-          if (err && typeof err === 'object') {
-            const data = err.data
-            if (
-              data &&
-              typeof data === 'object' &&
-              'message' in data
-            ) {
-              return String(data.message)
-            }
-            if (
-              'errors' in err &&
-              Array.isArray(err.errors) &&
-              err.errors.length > 0
-            ) {
-              return JSON.stringify(err.errors)
-            }
-          }
-          return 'Unknown OpenCode API error'
-        })()
+        const errorMessage = promptResult instanceof Error
+          ? promptResult.message
+          : extractSdkErrorMessage(promptResult.error)
         const errObj = promptResult instanceof Error
           ? promptResult
           : new Error(errorMessage)
@@ -3316,6 +3341,7 @@ export class ThreadSessionRuntime {
       agent: input.agent,
       model: input.model,
       permissions: input.permissions,
+      permissionRules: input.permissionRules,
       injectionGuardPatterns: input.injectionGuardPatterns,
       sourceMessageId: input.sourceMessageId,
       sourceThreadId: input.sourceThreadId,
@@ -3435,6 +3461,10 @@ export class ThreadSessionRuntime {
           // no explicit agent was already set (CLI --agent flag wins).
           agent: input.agent || result.agent,
           repliedMessage: result.repliedMessage,
+          permissionRules: [
+            ...(input.permissionRules ?? []),
+            ...(result.permissionRules ?? []),
+          ],
           preprocess: undefined,
         })
 
@@ -3625,6 +3655,30 @@ export class ThreadSessionRuntime {
     return threadState.removeQueueItemAtPosition(this.threadId, position)
   }
 
+  /**
+   * Update a queued message identified by its Discord source message ID.
+   * If newPrompt is empty, the item is removed from the queue.
+   * Returns { found: true, removed } if the item was in the queue,
+   * or { found: false } if it was already dispatched or never queued.
+   */
+  updateQueuedMessage(
+    sourceMessageId: string,
+    newPrompt: string,
+  ): { found: boolean; removed: boolean } {
+    const trimmed = newPrompt.trim()
+    const original = threadState.updateQueueItemBySourceMessageId(
+      this.threadId,
+      sourceMessageId,
+      (item) => {
+        if (!trimmed) return null
+        return { ...item, prompt: trimmed }
+      },
+    )
+    if (!original) return { found: false, removed: false }
+    if (!trimmed) return { found: true, removed: true }
+    return { found: true, removed: false }
+  }
+
   // ── Queue Drain ─────────────────────────────────────────────
 
   /**
@@ -3716,6 +3770,7 @@ export class ThreadSessionRuntime {
       prompt: input.prompt,
       agent: input.agent,
       permissions: input.permissions,
+      permissionRules: input.permissionRules,
       injectionGuardPatterns: input.injectionGuardPatterns,
       sessionStartScheduleKind: input.sessionStartScheduleKind,
       sessionStartScheduledTaskId: input.sessionStartScheduledTaskId,
@@ -3734,6 +3789,24 @@ export class ThreadSessionRuntime {
     }
     const { session, getClient, createdNewSession } = sessionResult
 
+    const updatePermissionsResult = await this.updateExistingSessionPermissions({
+      client: getClient(),
+      sessionId: session.id,
+      createdNewSession,
+      permissions: input.permissions,
+      permissionRules: input.permissionRules,
+    })
+    if (updatePermissionsResult instanceof Error) {
+      this.stopTyping()
+      await sendThreadMessage(
+        this.thread,
+        `Failed to update session permissions: ${updatePermissionsResult.message}`,
+        { flags: NOTIFY_MESSAGE_FLAGS },
+      )
+      await this.tryDrainQueue({ showIndicator: true })
+      return
+    }
+
     // Ensure listener is running now that we have a valid OpenCode client.
     // The eager start in enqueueIncoming may have failed if the client
     // wasn't initialized yet (fresh thread, first message).
@@ -3745,8 +3818,12 @@ export class ThreadSessionRuntime {
     const channelId = this.channelId
     const resolvedAppId = input.appId
 
-    if (input.agent && createdNewSession) {
+    // Explicit agent prompts (for example /plan-agent <prompt>) must update
+    // the session preference before dispatch. Otherwise the model can resolve
+    // from the requested agent while OpenCode keeps running the old agent.
+    if (input.agent) {
       await setSessionAgent(session.id, input.agent)
+      await clearSessionModel(session.id)
     }
 
     await ensureSessionPreferencesSnapshot({
@@ -4111,10 +4188,51 @@ export class ThreadSessionRuntime {
   // ── Session Ensure ──────────────────────────────────────────
   // Creates or reuses the OpenCode session for this thread.
 
+  private async updateExistingSessionPermissions({
+    client,
+    sessionId,
+    createdNewSession,
+    permissions,
+    permissionRules,
+  }: {
+    client: OpencodeClient
+    sessionId: string
+    createdNewSession: boolean
+    permissions?: string[]
+    permissionRules?: PermissionRuleset
+  }) {
+    if (createdNewSession) {
+      return null
+    }
+
+    const rules = [
+      ...(permissionRules ?? []),
+      ...parsePermissionRules(permissions ?? []),
+    ]
+    if (rules.length === 0) {
+      return null
+    }
+
+    const updateResult = await errore.tryAsync(() => {
+      return client.session.update({
+        sessionID: sessionId,
+        permission: rules,
+      })
+    })
+    if (updateResult instanceof Error) {
+      return updateResult
+    }
+    if (updateResult.error) {
+      return new Error('OpenCode rejected permission update')
+    }
+    return null
+  }
+
   private async ensureSession({
     prompt,
     agent,
     permissions,
+    permissionRules,
     injectionGuardPatterns,
     sessionStartScheduleKind,
     sessionStartScheduledTaskId,
@@ -4123,6 +4241,7 @@ export class ThreadSessionRuntime {
     agent?: string
     /** Raw "tool:action" strings from --permission flag */
     permissions?: string[]
+    permissionRules?: PermissionRuleset
     injectionGuardPatterns?: string[]
     sessionStartScheduleKind?: 'at' | 'cron'
     sessionStartScheduledTaskId?: number
@@ -4172,8 +4291,16 @@ export class ThreadSessionRuntime {
           directory: this.sdkDirectory,
         })
       })
-      if (!(sessionResponse instanceof Error) && sessionResponse.data) {
+      if (sessionResponse instanceof Error) {
+        logger.warn(
+          `[ENSURE SESSION] Failed to get existing session ${sessionId}: ${sessionResponse.message}`,
+        )
+      } else if (sessionResponse.data) {
         session = sessionResponse.data
+      } else {
+        logger.warn(
+          `[ENSURE SESSION] session.get returned no data for ${sessionId}`,
+        )
       }
     }
 
@@ -4189,14 +4316,31 @@ export class ThreadSessionRuntime {
           directory: this.sdkDirectory,
           originalRepoDirectory,
         }),
+        ...(permissionRules ?? []),
         ...parsePermissionRules(permissions ?? []),
       ]
       // Omit title so OpenCode auto-generates a summary from the conversation
-      const sessionResponse = await getClient().session.create({
-        directory: this.sdkDirectory,
-        permission: sessionPermissions,
+      const createResult = await errore.tryAsync(() => {
+        return getClient().session.create({
+          directory: this.sdkDirectory,
+          permission: sessionPermissions,
+        })
       })
-      session = sessionResponse.data
+      if (createResult instanceof Error) {
+        logger.error(
+          `[ENSURE SESSION] session.create failed: ${createResult.message}`,
+        )
+        return new Error(
+          `Failed to create session: ${createResult.message}, threadId=${this.thread.id}, directory=${this.sdkDirectory}`,
+          { cause: createResult },
+        )
+      }
+      session = createResult.data
+      if (!session) {
+        logger.warn(
+          `[ENSURE SESSION] session.create returned no data, threadId=${this.thread.id}, directory=${this.sdkDirectory}`,
+        )
+      }
       // Insert DB row immediately so the external-sync poller sees
       // source='kimaki' before the next poll tick and skips this session.
       // The upsert at the end of ensureSession is kept for the reuse path.
@@ -4213,7 +4357,9 @@ export class ThreadSessionRuntime {
     }
 
     if (!session) {
-      return new Error('Failed to create or get session')
+      return new Error(
+        `Failed to create or get session: threadId=${this.thread.id}, channelId=${this.channelId}, directory=${directory}, sdkDirectory=${this.sdkDirectory}, existingSessionId=${sessionId ?? 'none'}, createdNewSession=${createdNewSession}`,
+      )
     }
 
     // Store session in DB and thread state
@@ -4569,4 +4715,12 @@ function formatSessionErrorFromProps(error?: {
     parts.push(`[${data.providerID}]`)
   }
   return parts.length > 0 ? parts.join(' ') : error.name || 'Unknown error'
+}
+
+function truncateSessionErrorMessage(message: string): string {
+  const maxLength = 400
+  if (message.length <= maxLength) {
+    return message
+  }
+  return `${message.slice(0, maxLength - 1)}…`
 }

@@ -1,73 +1,104 @@
 import { describe, expect, test } from 'vitest'
-import { extractBtwPrefix } from './btw-prefix-detection.js'
+import { extractBtwSuffix } from './btw-prefix-detection.js'
 
-describe('extractBtwPrefix', () => {
-  test('matches lowercase prefix', () => {
-    expect(extractBtwPrefix('btw fix this')).toMatchInlineSnapshot(`
+describe('extractBtwSuffix', () => {
+  test('matches after period', () => {
+    expect(extractBtwSuffix('fix the bug. btw')).toMatchInlineSnapshot(`
       {
-        "prompt": "fix this",
+        "forceBtw": true,
+        "prompt": "fix the bug",
       }
     `)
   })
 
-  test('matches uppercase prefix', () => {
-    expect(extractBtwPrefix('BTW check this')).toMatchInlineSnapshot(`
+  test('matches after exclamation', () => {
+    expect(extractBtwSuffix('done! btw')).toMatchInlineSnapshot(`
       {
-        "prompt": "check this",
+        "forceBtw": true,
+        "prompt": "done",
       }
     `)
   })
 
-  test('keeps multiline content', () => {
-    expect(extractBtwPrefix('  btw first line\nsecond line  ')).toMatchInlineSnapshot(`
+  test('matches after comma', () => {
+    expect(extractBtwSuffix('sure, btw')).toMatchInlineSnapshot(`
       {
+        "forceBtw": true,
+        "prompt": "sure",
+      }
+    `)
+  })
+
+  test('matches after newline', () => {
+    expect(extractBtwSuffix('fix the bug\nbtw')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": true,
+        "prompt": "fix the bug",
+      }
+    `)
+  })
+
+  test('matches with trailing dot', () => {
+    expect(extractBtwSuffix('fix the bug. btw.')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": true,
+        "prompt": "fix the bug",
+      }
+    `)
+  })
+
+  test('case insensitive', () => {
+    expect(extractBtwSuffix('done. BTW')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": true,
+        "prompt": "done",
+      }
+    `)
+  })
+
+  test('no space between punctuation and btw', () => {
+    expect(extractBtwSuffix('done.btw')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": true,
+        "prompt": "done",
+      }
+    `)
+  })
+
+  test('does not match at start of message', () => {
+    expect(extractBtwSuffix('btw fix this')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": false,
+        "prompt": "btw fix this",
+      }
+    `)
+  })
+
+  test('does not match mid-message without punctuation', () => {
+    expect(extractBtwSuffix('hello btw')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": false,
+        "prompt": "hello btw",
+      }
+    `)
+  })
+
+  test('does not match empty content', () => {
+    expect(extractBtwSuffix('')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": false,
+        "prompt": "",
+      }
+    `)
+  })
+
+  test('multiline message with btw at end', () => {
+    expect(extractBtwSuffix('first line\nsecond line. btw')).toMatchInlineSnapshot(`
+      {
+        "forceBtw": true,
         "prompt": "first line
       second line",
       }
     `)
-  })
-
-  test('matches dot separator', () => {
-    expect(extractBtwPrefix('btw. fix this')).toMatchInlineSnapshot(`
-      {
-        "prompt": "fix this",
-      }
-    `)
-  })
-
-  test('matches comma separator', () => {
-    expect(extractBtwPrefix('btw, fix this')).toMatchInlineSnapshot(`
-      {
-        "prompt": "fix this",
-      }
-    `)
-  })
-
-  test('matches colon separator', () => {
-    expect(extractBtwPrefix('btw: fix this')).toMatchInlineSnapshot(`
-      {
-        "prompt": "fix this",
-      }
-    `)
-  })
-
-  test('matches punctuation without trailing space', () => {
-    expect(extractBtwPrefix('btw.fix this')).toMatchInlineSnapshot(`
-      {
-        "prompt": "fix this",
-      }
-    `)
-  })
-
-  test('does not match without separating whitespace', () => {
-    expect(extractBtwPrefix('btwfix this')).toMatchInlineSnapshot(`null`)
-  })
-
-  test('does not match mid-message', () => {
-    expect(extractBtwPrefix('hello btw fix this')).toMatchInlineSnapshot(`null`)
-  })
-
-  test('does not match empty payload', () => {
-    expect(extractBtwPrefix('btw   ')).toMatchInlineSnapshot(`null`)
   })
 })

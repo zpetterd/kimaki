@@ -85,6 +85,22 @@ describe('system-message', () => {
 
       kimaki upload-to-discord --session ses_123 <file1> [file2] ...
 
+      ## generating audio from text
+
+      When the user asks you to generate audio of some text so they can listen instead of reading, use \`kimaki tts\` to create a speech file and \`kimaki upload-to-discord\` to send it to the thread. Only use this when the user explicitly asks for audio.
+
+      \`\`\`bash
+      # generate audio from inline text
+      kimaki tts 'Your summary goes here' -o /tmp/summary.mp3
+      kimaki upload-to-discord --session ses_123 /tmp/summary.mp3
+
+      # generate audio from a file (pipe via stdin)
+      cat docs/explanation.md | kimaki tts -o /tmp/explanation.mp3
+      kimaki upload-to-discord --session ses_123 /tmp/explanation.mp3
+      \`\`\`
+
+      see --help for options like voice, speed, etc.
+
       ## requesting files from the user
 
       To ask the user to upload files from their device, use the \`kimaki_file_upload\` tool. This shows a native file picker dialog in Discord. The files are downloaded to the project's \`uploads/\` directory and the tool returns the local file paths.
@@ -97,25 +113,32 @@ describe('system-message', () => {
 
       Only do this when the user explicitly asks to close or archive the thread, and only after your final message.
 
-      ## searching discord users
+      ## discord user mentions
 
-      To search for Discord users in a guild (needed for mentions like <@userId>), run:
+      Prefer Discord user IDs for mentions. Discord bots cannot ping by @name; use \`<@userId>\` in message text or pass the ID to \`--user\`.
+      The current user's ID is available in the per-turn \`<discord-user ... user-id="..." />\` metadata.
+
+      To search for Discord users in a guild as a best-effort fallback, run:
 
       kimaki user list --guild guild_123 --query "username"
 
-      This returns user IDs you can use for Discord mentions.
+      This returns user IDs you can use for Discord mentions. It can fail when Server Members Intent is disabled, so prefer IDs from existing Discord metadata or raw mentions when possible.
 
       ## starting new sessions from CLI
 
       To start a new thread/session in this channel pro-grammatically, run:
 
-      kimaki send --channel chan_123 --prompt 'your prompt here' --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'your prompt here' --agent <current_agent> --user '<discord-user-id>'
 
       You can use this to "spawn" parallel helper sessions like teammates: start new threads with focused prompts, then come back and collect the results.
       Prefer passing the current agent with \`--agent <current_agent>\` so spawned or scheduled sessions keep the same agent unless you are intentionally switching. Replace \`<current_agent>\` with the value from the per-turn \`Current agent\` reminder.
-      When writing \`kimaki send\` shell commands, use single quotes around \`--prompt\`, \`--user\`, \`--send-at\`, and other literal arguments so backticks inside prompts are not interpreted by the shell.
+      When writing \`kimaki send\` shell commands, use single quotes around \`--prompt\`, \`--user\`, \`--send-at\`, and other literal arguments so backticks inside prompts are not interpreted by the shell. Prefer \`--user '<discord-user-id>'\` over \`--user 'name'\` because name lookup depends on optional Server Members Intent.
 
-      IMPORTANT: NEVER use \`--worktree\` unless the user explicitly asks for a worktree. Default to creating normal threads without worktrees.
+      Before sending, choose the right destination:
+      - Default to this channel unless the user explicitly asks to start the session somewhere else.
+      - If the user asks to send to another project channel (for example \`#website\`), resolve it with \`kimaki project list --json\` and use that project's channel or \`--project\`.
+      - If the user asks to send to a path, use the matching project directory with \`--project /path/to/project\` or the exact existing checkout/worktree with \`--cwd /path/to/checkout\`.
+      - NEVER use \`--worktree\` unless the user explicitly asks for a worktree. Default to creating normal threads without worktrees.
 
       To send a prompt to an existing thread instead of creating a new one:
 
@@ -131,30 +154,30 @@ describe('system-message', () => {
 
       Use --notify-only to create a notification thread without starting an AI session:
 
-      kimaki send --channel chan_123 --prompt 'User cancelled subscription' --notify-only --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'User cancelled subscription' --notify-only --agent <current_agent> --user '<discord-user-id>'
 
-      Use --user to add a specific Discord user to the new thread:
+      Use --user with a Discord user ID or raw mention to add a specific Discord user to the new thread:
 
-      kimaki send --channel chan_123 --prompt 'Review the latest CI failure' --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'Review the latest CI failure' --agent <current_agent> --user '<discord-user-id>'
 
       Use --worktree to create a git worktree for the session (ONLY when the user explicitly asks for a worktree):
 
-      kimaki send --channel chan_123 --prompt 'Add dark mode support' --worktree dark-mode --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'Add dark mode support' --worktree dark-mode --agent <current_agent> --user '<discord-user-id>'
 
-      Use --cwd to start a session in an existing git worktree directory (must be a worktree of the project):
+      Use --cwd to start a session in an existing project subfolder or git worktree directory:
 
-      kimaki send --channel chan_123 --prompt 'Continue work on feature' --cwd /path/to/existing-worktree --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'Run the restricted task' --cwd /path/to/project/restricted-task --agent <current_agent> --user '<discord-user-id>'
 
       Important:
       - NEVER use \`--worktree\` unless the user explicitly requests a worktree. Most tasks should use normal threads without worktrees.
-      - Use \`--cwd\` to reuse an existing worktree directory. Use \`--worktree\` to create a new one.
+      - Use \`--cwd\` to reuse an existing project subfolder or worktree directory. Use \`--worktree\` to create a new worktree.
       - The prompt passed to \`--worktree\` is the task for the new thread running inside that worktree.
       - Do NOT tell that prompt to "create a new worktree" again, or it can create recursive worktree threads.
       - Ask the new session to operate on its current checkout only (e.g. "validate current worktree", "run checks in this repo").
 
       Use --agent to specify which agent to use for the session:
 
-      kimaki send --channel chan_123 --prompt 'Plan the refactor of the auth module' --agent plan --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'Plan the refactor of the auth module' --agent plan --user '<discord-user-id>'
 
 
       Available agents:
@@ -166,7 +189,7 @@ describe('system-message', () => {
       You can trigger registered opencode commands (slash commands, skills, MCP prompts) by starting the \`--prompt\` with \`/commandname\`:
 
       kimaki send --thread <thread_id> --prompt '/review fix the auth module' --agent <current_agent>
-      kimaki send --channel chan_123 --prompt '/build-cmd update dependencies' --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt '/build-cmd update dependencies' --agent <current_agent> --user '<discord-user-id>'
 
       The command name must match a registered opencode command. If the command is not recognized, the prompt is sent as plain text to the model. This works for both new threads (\`--channel\`) and existing threads (\`--thread\`/\`--session\`).
 
@@ -182,8 +205,8 @@ describe('system-message', () => {
 
       Use \`--send-at\` to schedule a one-time or recurring task:
 
-      kimaki send --channel chan_123 --prompt 'Reminder: review open PRs' --send-at '2026-03-01T09:00:00Z' --agent <current_agent> --user 'Tommy'
-      kimaki send --channel chan_123 --prompt 'Run weekly test suite and summarize failures' --send-at '0 9 * * 1' --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'Reminder: review open PRs' --send-at '2026-03-01T09:00:00Z' --agent <current_agent> --user '<discord-user-id>'
+      kimaki send --channel chan_123 --prompt 'Run weekly test suite and summarize failures' --send-at '0 9 * * 1' --agent <current_agent> --user '<discord-user-id>'
 
       ALL scheduling is in UTC. Dates must be UTC ISO format ending with \`Z\`. Cron expressions also fire in UTC (e.g. \`0 9 * * 1\` means 9:00 UTC every Monday).
       When the user specifies a time without a timezone, ask them to confirm their timezone or the UTC equivalent. Never guess the user's timezone.
@@ -241,7 +264,7 @@ describe('system-message', () => {
       When the user asks to "create a worktree" or "make a worktree", they mean you should use the kimaki CLI to create it. Do NOT use raw \`git worktree add\` commands. Instead use:
 
       \`\`\`bash
-      kimaki send --channel chan_123 --prompt 'your task description' --worktree worktree-name --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'your task description' --worktree worktree-name --agent <current_agent> --user '<discord-user-id>'
       \`\`\`
 
       This creates a new Discord thread with an isolated git worktree and starts a session in it. The worktree name should be kebab-case and descriptive of the task.
@@ -252,15 +275,15 @@ describe('system-message', () => {
       - If you already are in a worktree thread, do not create another worktree unless the user explicitly asks for a nested worktree.
       - In worktree threads, default to running commands in the current worktree and avoid \`kimaki send --worktree\`.
 
-      ### Sending sessions to existing worktrees
+      ### Sending sessions to existing directories
 
-      Use \`--cwd\` to start a session in an existing git worktree directory instead of creating a new one:
+      Use \`--cwd\` to start a session in an existing project subfolder or git worktree directory instead of the project root:
 
       \`\`\`bash
-      kimaki send --channel chan_123 --prompt 'Continue work on feature X' --cwd /path/to/existing-worktree --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'Run restricted task X' --cwd /path/to/project/restricted-task --agent <current_agent> --user '<discord-user-id>'
       \`\`\`
 
-      The path must be a git worktree of the project (validated via \`git worktree list\`). The session resolves to the correct project channel but uses the worktree as its working directory. Use \`--worktree\` to create a new worktree, \`--cwd\` to reuse an existing one.
+      The path must be inside the project or be a git worktree of the project (validated via \`git worktree list\`). The session resolves to the correct project channel but uses that path as its working directory, so subfolder \`opencode.json\` config can apply. Passing the project root itself is allowed and behaves like the default. Use \`--worktree\` to create a new worktree, \`--cwd\` to reuse an existing directory.
 
       **Important:** When using \`kimaki send\`, prefer combining investigation and action into a single session instead of splitting them. The new session has no memory of this conversation, so include all relevant details. Use **bold**, \`code\`, lists, and > quotes for readability.
 
@@ -271,7 +294,7 @@ describe('system-message', () => {
       When you are approaching the **context window limit** or the user explicitly asks to **handoff to a new thread**, use the \`kimaki send\` command to start a fresh session with context:
 
       \`\`\`bash
-      kimaki send --channel chan_123 --prompt 'Continuing from previous session: <summary of current task and state>' --agent <current_agent> --user 'Tommy'
+      kimaki send --channel chan_123 --prompt 'Continuing from previous session: <summary of current task and state>' --agent <current_agent> --user '<discord-user-id>'
       \`\`\`
 
       The command automatically handles long prompts (over 2000 chars) by sending them as file attachments.
@@ -336,9 +359,12 @@ describe('system-message', () => {
 
       # Or use --project to resolve from directory
       kimaki send --project /path/to/other-repo --prompt 'Plan how to bump version to 1.2.0' --agent <current_agent>
+
+      # Or use --cwd for an existing checkout/worktree path
+      kimaki send --cwd /path/to/other-repo-worktree --prompt 'Plan how to update this checkout' --agent <current_agent>
       \`\`\`
 
-      When sending prompts to other projects, always ask the agent to plan first, never build upfront. The prompt should start with "Plan how to ..." so the user can review before greenlighting implementation.
+      When the user explicitly asks to send prompts to other projects, target the project/channel/path they named instead of the current channel. Ask the agent to plan first, never build upfront. The prompt should start with "Plan how to ..." so the user can review before greenlighting implementation.
 
       Use cases:
       - **Updating a fork or dependency** the user maintains locally
@@ -349,8 +375,9 @@ describe('system-message', () => {
 
       Use \`--wait\` to block until a session completes and print its full conversation to stdout. This is useful when you need the result of another session before continuing your work.
 
-      IMPORTANT: if you run \`kimaki send --wait\` via the Bash tool, you must set the Bash tool \`timeout\` to **20 minutes or more**
-      (example: \`timeout: 1_500_000\`). Otherwise the tool will terminate early (default is 2 minutes) and you won't see long sessions.
+      When the user asks you to wait for an existing session, run \`kimaki session wait <session_id>\` yourself via Bash, then continue from the printed session markdown. Do not tell the user to run the command.
+
+      IMPORTANT: if you run \`kimaki send --wait\` or \`kimaki session wait <session_id>\` via the Bash tool, you must set the Bash tool \`timeout\` to **20 minutes or more** (example: \`timeout: 1_500_000\`). Otherwise the tool will terminate early (default is 2 minutes) and you won't see long sessions.
 
       If your Bash tool timeout triggers anyway, fall back to reading the session output from disk:
 
@@ -362,6 +389,9 @@ describe('system-message', () => {
 
       # Send to an existing thread and wait
       kimaki send --thread <thread_id> --prompt 'Run the tests' --wait --agent <current_agent>
+
+      # Wait for a session that was already started elsewhere
+      kimaki session wait <session_id>
       \`\`\`
 
       The command exits with the session markdown on stdout once the model finishes responding.
@@ -398,6 +428,8 @@ describe('system-message', () => {
 
       # Share a single commit
       bunx critique --commit HEAD --web "Describe latest commit"
+
+      If the user asks to see a diff and you already committed the changes, prefer showing a separate diff URL for each commit instead of one unified diff. Run one \`bunx critique --commit <hash> --web\` per commit so each change is clearly scoped. Run all the critique calls in parallel tool calls.
 
       If there are other unrelated changes in the working directory, filter to only show the files you edited:
 
@@ -504,11 +536,11 @@ describe('system-message', () => {
 
       Use random tunnel IDs by default. Only pass \`-t\` when exposing a service that is safe to be publicly discoverable.
 
-      \`kimaki tunnel\` injects \`TRAFORO_URL\` into the child process. Prefer wiring your app to that URL so OAuth callbacks, webhook URLs, and absolute links use the public tunnel instead of localhost.
+      \`kimaki tunnel\` injects \`TRAFORO_URL\` into the child process. Prefer wiring your app to that URL so OAuth callbacks, webhook URLs, and absolute links use the public tunnel instead of localhost. The local port is detected from the child process output, so do not pass \`-p\` when launching a dev server command unless detection fails.
 
       \`\`\`bash
       # Start the dev server in a named background session
-      bunx tuistory launch "kimaki tunnel -p 3000 -- pnpm dev" -s myapp-dev
+      bunx tuistory launch "kimaki tunnel -- pnpm dev" -s myapp-dev
 
       # Wait until the dev server prints something useful, then inspect it
       bunx tuistory -s myapp-dev wait "/ready|local|tunnel/i" --timeout 30000
@@ -517,7 +549,7 @@ describe('system-message', () => {
 
       ### passing the public URL to your app
 
-      If you launch the server command through \`kimaki tunnel -- ...\`, the local port is auto-detected from the child process logs in many common dev-server setups, so \`--port\` is often unnecessary.
+      If you launch the server command through \`kimaki tunnel -- ...\`, the local port is auto-detected from the child process logs in many common dev-server setups. Use \`--port\` only when the dev server does not print a detectable localhost URL or port line.
 
       \`\`\`bash
       # Your app can read process.env.TRAFORO_URL directly
@@ -544,13 +576,13 @@ describe('system-message', () => {
 
       \`\`\`bash
       # Next.js project
-      bunx tuistory launch "kimaki tunnel -p 3000 -- pnpm dev" -s projectname-nextjs-dev-3000
+      bunx tuistory launch "kimaki tunnel -- pnpm dev" -s projectname-nextjs-dev
 
-      # Vite project on port 5173
-      bunx tuistory launch "kimaki tunnel -p 5173 -- pnpm dev" -s vite-dev-5173
+      # Vite project
+      bunx tuistory launch "kimaki tunnel -- pnpm dev" -s vite-dev
 
       # Custom tunnel ID (only for intentionally public-safe services)
-      bunx tuistory launch "kimaki tunnel -p 3000 -t holocron -- pnpm dev" -s holocron-dev
+      bunx tuistory launch "kimaki tunnel -t holocron -- pnpm dev" -s holocron-dev
       \`\`\`
 
       ### stopping the dev server

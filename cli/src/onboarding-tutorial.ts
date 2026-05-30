@@ -136,7 +136,7 @@ Pick a random port between 3000-9000 to avoid conflicts:
 
 ${backticks}bash
 PORT=$((RANDOM % 6000 + 3000))
-bunx tuistory launch "PORT=$PORT kimaki tunnel -p $PORT -- bun run server.ts" -s game-dev --cwd "$PWD"
+bunx tuistory launch "PORT=$PORT kimaki tunnel -- bun run server.ts" -s game-dev --cwd "$PWD"
 ${backticks}
 
 Wait a moment, then get the tunnel URL:

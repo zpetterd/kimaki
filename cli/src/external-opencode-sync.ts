@@ -32,12 +32,17 @@ import {
 } from './opencode.js'
 import { isEssentialToolPart } from './session-handler/thread-session-runtime.js'
 import { notifyError } from './sentry.js'
+import { store } from './store.js'
 import { extractNonXmlContent } from './xml.js'
 
 
 const logger = createLogger(LogPrefix.OPENCODE)
 
 const EXTERNAL_SYNC_INTERVAL_MS = 5_000
+// Per-directory timeout: if opencode is slow/hung for one directory,
+// skip it and move on to the next. Prevents one slow directory from
+// blocking the entire sync loop and keeping the polling guard locked.
+const SYNC_PER_DIRECTORY_TIMEOUT_MS = 30_000
 // Don't sync sessions from before the CLI started. 5 min grace window
 // covers sessions that were just created before the bot connected.
 const CLI_START_MS = Date.now() - 5 * 60 * 1000
@@ -440,6 +445,7 @@ async function syncSessionToThread({
   channelId,
   sessionId,
   sessionTitle,
+  signal,
 }: {
   client: OpencodeClient
   discordClient: Client
@@ -447,6 +453,7 @@ async function syncSessionToThread({
   channelId: string
   sessionId: string
   sessionTitle?: string | null
+  signal: AbortSignal
 }): Promise<void> {
   const messagesResponse = await client.session.messages({
     sessionID: sessionId,
@@ -459,6 +466,7 @@ async function syncSessionToThread({
   if (messagesResponse instanceof Error) {
     throw messagesResponse
   }
+  if (signal.aborted) return
   const messages = messagesResponse.data || []
 
   // Pure derivation from opencode events: if the latest user turn has
@@ -482,6 +490,7 @@ async function syncSessionToThread({
   if (thread instanceof Error) {
     throw thread
   }
+  if (signal.aborted) return
 
   const [existingPartIds, verbosity] = await Promise.all([
     getPartMessageIds(thread.id),
@@ -498,6 +507,7 @@ async function syncSessionToThread({
 
   const batched = batchChunksForDiscord(chunks)
   for (const batch of batched) {
+    if (signal.aborted) return
     const sentMessage = await sendThreadMessage(thread, batch.content)
     await setPartMessagesBatch(
       batch.partIds.map((partId) => ({
@@ -543,6 +553,133 @@ async function pulseTypingForBusySessions({
 
 const EXTERNAL_SYNC_MAX_SESSIONS = 50
 
+// Tracks directories with an in-flight sync. When a directory times out,
+// its AbortController is aborted so the inner work stops producing side
+// effects (Discord messages, DB writes). The next poll tick skips the
+// directory if it still has an active controller (prevents overlap).
+const activeDirectorySyncs = new Map<string, AbortController>()
+
+// Sync one directory with a timeout and abort. If the opencode server is
+// slow or unresponsive, the AbortController fires so the inner work stops
+// before producing Discord side effects. The timer is always cleaned up.
+async function syncDirectory({
+  target,
+  discordClient,
+}: {
+  target: DirectorySyncTarget
+  discordClient: Client
+}): Promise<void> {
+  const { directory } = target
+
+  // Skip if a previous timed-out sync for this directory is still running.
+  if (activeDirectorySyncs.has(directory)) {
+    logger.warn(`[EXTERNAL_SYNC] Skipping ${directory}: previous sync still in flight`)
+    return
+  }
+
+  const controller = new AbortController()
+  activeDirectorySyncs.set(directory, controller)
+
+  const timeout = setTimeout(() => {
+    controller.abort(new Error(`Sync timed out after ${SYNC_PER_DIRECTORY_TIMEOUT_MS}ms for ${directory}`))
+  }, SYNC_PER_DIRECTORY_TIMEOUT_MS)
+
+  try {
+    await syncDirectoryInner({
+      ...target,
+      discordClient,
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timeout)
+    activeDirectorySyncs.delete(directory)
+  }
+}
+
+async function syncDirectoryInner({
+  directory,
+  channelId,
+  startMs,
+  discordClient,
+  signal,
+}: {
+  directory: string
+  channelId: string
+  startMs: number
+  discordClient: Client
+  signal: AbortSignal
+}): Promise<void> {
+  const clientResult = await initializeOpencodeForDirectory(directory, {
+    channelId,
+  })
+  if (clientResult instanceof Error) {
+    logger.warn(
+      `[EXTERNAL_SYNC] Failed to initialize OpenCode for ${directory}: ${clientResult.message}`,
+    )
+    return
+  }
+  if (signal.aborted) return
+
+  const client = clientResult()
+  const sessionsResponse = await client.session.list({
+    directory,
+    start: startMs,
+    limit: EXTERNAL_SYNC_MAX_SESSIONS,
+  }).catch((error) => {
+    return new Error(`Failed to list sessions for ${directory}`, {
+      cause: error,
+    })
+  })
+  if (sessionsResponse instanceof Error) {
+    logger.warn(`[EXTERNAL_SYNC] ${sessionsResponse.message}`)
+    return
+  }
+  if (signal.aborted) return
+
+  const statusesResponse = await client.session.status({
+    directory,
+  }).catch(() => {
+    return null
+  })
+  if (statusesResponse?.data) {
+    await pulseTypingForBusySessions({
+      discordClient,
+      statuses: statusesResponse.data as Record<string, { type: string }>,
+    }).catch(() => {})
+  }
+  if (signal.aborted) return
+
+  const sessions = (sessionsResponse.data || []).filter((session) => {
+    const title = session.title || ''
+    if (/^new session\s*-/i.test(title)) {
+      return false
+    }
+    return !/subagent\)\s*$/i.test(title)
+  })
+  const sorted = sortSessionsByRecency(sessions)
+
+  for (const session of sorted) {
+    if (signal.aborted) return
+    await syncSessionToThread({
+      client,
+      discordClient,
+      directory,
+      channelId,
+      sessionId: session.id,
+      sessionTitle: session.title,
+      signal,
+    }).catch((error) => {
+      logger.warn(
+        `[EXTERNAL_SYNC] Failed syncing session ${session.id}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      void notifyError(
+        error instanceof Error ? error : new Error(String(error)),
+        `External session sync failed for ${session.id}`,
+      )
+    })
+  }
+}
+
 async function pollExternalSessions({
   discordClient,
 }: {
@@ -558,73 +695,15 @@ async function pollExternalSessions({
   }
 
   for (const target of directoryTargets) {
-    const directory = target.directory
-    const channelId = target.channelId
-    const startMs = target.startMs
-
-    const clientResult = await initializeOpencodeForDirectory(directory, {
-      channelId,
-    })
-    if (clientResult instanceof Error) {
-      logger.warn(
-        `[EXTERNAL_SYNC] Failed to initialize OpenCode for ${directory}: ${clientResult.message}`,
-      )
-      continue
-    }
-
-    const client = clientResult()
-    const sessionsResponse = await client.session.list({
-      directory,
-      start: startMs,
-      limit: EXTERNAL_SYNC_MAX_SESSIONS,
+    const syncResult = await syncDirectory({
+      target,
+      discordClient,
     }).catch((error) => {
-      return new Error(`Failed to list sessions for ${directory}`, {
-        cause: error,
-      })
+      return new Error(`Sync failed for ${target.directory}`, { cause: error })
     })
-    if (sessionsResponse instanceof Error) {
-      logger.warn(`[EXTERNAL_SYNC] ${sessionsResponse.message}`)
-      continue
-    }
-
-    const statusesResponse = await client.session.status({
-      directory,
-    }).catch(() => {
-      return null
-    })
-    if (statusesResponse?.data) {
-      await pulseTypingForBusySessions({
-        discordClient,
-        statuses: statusesResponse.data as Record<string, { type: string }>,
-      }).catch(() => {})
-    }
-
-    const sessions = (sessionsResponse.data || []).filter((session) => {
-      const title = session.title || ''
-      if (/^new session\s*-/i.test(title)) {
-        return false
-      }
-      return !/subagent\)\s*$/i.test(title)
-    })
-    const sorted = sortSessionsByRecency(sessions)
-
-    for (const session of sorted) {
-      await syncSessionToThread({
-        client,
-        discordClient,
-        directory,
-        channelId,
-        sessionId: session.id,
-        sessionTitle: session.title,
-      }).catch((error) => {
-        logger.warn(
-          `[EXTERNAL_SYNC] Failed syncing session ${session.id}: ${error instanceof Error ? error.message : String(error)}`,
-        )
-        void notifyError(
-          error instanceof Error ? error : new Error(String(error)),
-          `External session sync failed for ${session.id}`,
-        )
-      })
+    if (syncResult instanceof Error) {
+      logger.warn(`[EXTERNAL_SYNC] ${syncResult.message}`)
+      void notifyError(syncResult, `External session sync directory failure: ${target.directory}`)
     }
   }
 }
@@ -638,6 +717,10 @@ export function startExternalOpencodeSessionSync({
     process.env.KIMAKI_VITEST &&
     process.env.KIMAKI_ENABLE_EXTERNAL_OPENCODE_SYNC !== '1'
   ) {
+    return
+  }
+  if (!store.getState().syncEnabled) {
+    logger.log('[EXTERNAL_SYNC] Background sync disabled via --disable-sync')
     return
   }
   if (externalSyncInterval) {

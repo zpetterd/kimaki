@@ -13,21 +13,21 @@ after making important changes to queueing or message handling always run the fu
 kimaki is a monorepo with three main packages that communicate via a shared Postgres database hosted on PlanetScale.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  User's machine                                             │
-│  cli/ (TypeScript CLI + Discord bot)                        │
-│  ├── src/cli.ts        main CLI, onboarding wizard          │
-│  ├── src/discord-bot.ts  event loop, session routing        │
-│  └── SQLite (~/.kimaki/discord-sessions.db)                 │
-│         local state: bot tokens, channels, threads, models  │
-└────────┬──────────────────────────┬─────────────────────────┘
-         │ REST + WebSocket         │ polls /api/onboarding/status
-         │ (clientId:secret)        │ during first-time setup
-         ▼                          ▼
-┌─────────────────────┐   ┌──────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────┐
+│  User's machine                                               │
+│  cli/ (TypeScript CLI + Discord bot)                          │
+│  ├── src/cli.ts        main CLI, onboarding wizard            │
+│  ├── src/discord-bot.ts  event loop, session routing          │
+│  └── SQLite (~/.kimaki/discord-sessions.db)                   │
+│         local state: bot tokens, channels, threads, models    │
+└─────────┬────────────────────────────┬───────────────────────┘
+          │ REST + WebSocket           │ polls /api/onboarding/status
+          │ (clientId:secret)          │ during first-time setup
+          ▼                            ▼
+┌──────────────────────┐   ┌──────────────────────────────────┐
 │  gateway-proxy/      │   │  website/                        │
 │  (Rust, fly.io)      │   │  (Cloudflare Worker, Hono)       │
-│                      │   │  https://kimaki.dev           │
+│                      │   │  https://kimaki.dev          │
 │  Sits between the    │   │                                  │
 │  CLI and Discord.    │   │  GET /oauth/callback              │
 │  One shared bot for  │   │    → upserts gateway_clients row │
@@ -45,20 +45,20 @@ kimaki is a monorepo with three main packages that communicate via a shared Post
 └──────────┬───────────┘              │
            │                          │
            ▼                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Shared Postgres (PlanetScale)                               │
-│  db/schema.prisma                                            │
-│                                                              │
-│  gateway_clients table:                                      │
-│    client_id  TEXT   ── identifies the kimaki user            │
-│    secret     TEXT   ── authenticates gateway connections     │
-│    guild_id   TEXT   ── guild the user installed the bot in   │
-│    @@id([client_id, guild_id])                               │
-│                                                              │
-│  Written by: website (on OAuth callback)                     │
-│  Read by: gateway-proxy (polls every 1s via db_config.rs)    │
-│  Read by: website (onboarding status check)                  │
-└──────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│  Shared Postgres (PlanetScale)                                │
+│  db/schema.prisma                                             │
+│                                                               │
+│  gateway_clients table:                                       │
+│    client_id  TEXT   ── identifies the kimaki user             │
+│    secret     TEXT   ── authenticates gateway connections      │
+│    guild_id   TEXT   ── guild the user installed the bot in    │
+│    @@id([client_id, guild_id])                                │
+│                                                               │
+│  Written by: website (on OAuth callback)                      │
+│  Read by: gateway-proxy (polls every 1s via db_config.rs)     │
+│  Read by: website (onboarding status check)                   │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ## gateway-proxy (Rust)
@@ -222,6 +222,10 @@ when adding new tables:
 do NOT add simple prisma query wrappers to database.ts. if a query is a straightforward `findMany`, `findUnique`, `create`, etc. with no complex logic, inline the prisma call directly at the call site. database.ts is not a repository layer — it only exists for queries that are genuinely complex (multi-step transactions, migrations) or called from 3+ places. when in doubt, inline it.
 
 prisma version in package.json MUST be pinned. no ^. this makes sure the generated prisma code is compatible with the prisma client used in the npm package
+
+## github issues
+
+never suggest installing kimaki from git (e.g. `npm i -g remorses/kimaki#main`). it does not work because the package needs a build step. always point users to the next npm release instead.
 
 ## libsql in-memory gotcha
 
@@ -409,6 +413,14 @@ jq -r '[.timestamp, .event.type] | @tsv' ~/.kimaki/opencode-session-events/ses_x
 ```
 
 for checkout validation requests, prefer non-recursive checks unless the user asks otherwise.
+
+## kimaki command shim (`~/.kimaki/bin/kimaki`)
+
+`ensureKimakiCommandShim()` in `cli/src/opencode-command.ts` generates a shell script at `~/.kimaki/bin/kimaki` (or `kimaki.cmd` on Windows) every time the bot starts. it captures `process.execPath`, `process.execArgv`, and `process.argv[1]` into an `exec` one-liner so the shim always mirrors the current process.
+
+the shim directory is prepended to `PATH` in the env passed to the opencode server process (`cli/src/opencode.ts`). this lets AI agent sessions run `kimaki send`, `kimaki upload-to-discord`, `kimaki tunnel`, etc. as regular shell commands via the bash tool, regardless of how kimaki was installed (npx, global install, local dev).
+
+in local dev the shim contains tsx loader flags (`--require` / `--import`) because the bot was launched with tsx against the raw `.ts` entry point. in production (npm package) there are no tsx flags and the entry script is the compiled `bin.js`. the shim just reflects however the current process was started; there is no special-casing.
 
 ## opencode plugin and env vars
 

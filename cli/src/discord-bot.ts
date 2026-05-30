@@ -10,7 +10,6 @@ import {
   getChannelWorktreesEnabled,
   getChannelMentionMode,
   getChannelDirectory,
-  getPrisma,
   cancelAllPendingIpcRequests,
   deleteChannelDirectoryById,
   createPendingWorktree,
@@ -20,7 +19,7 @@ import {
   stopOpencodeServer,
 } from './opencode.js'
 import { formatAutoWorktreeName, createWorktreeInBackground, worktreeCreatingMessage } from './commands/new-worktree.js'
-import { validateWorktreeDirectory, git } from './worktrees.js'
+import { resolveSessionWorkingDirectory, git, isGitRepositoryRoot } from './worktrees.js'
 import { WORKTREE_PREFIX } from './commands/merge-worktree.js'
 import {
   escapeBackticksInCodeBlocks,
@@ -32,6 +31,7 @@ import {
   stripMentions,
   hasKimakiBotPermission,
   hasNoKimakiRole,
+  resolveGuildMessageMember,
 } from './discord-utils.js'
 import {
   getOpencodeSystemMessage,
@@ -43,10 +43,12 @@ import {
   getTextAttachments,
   resolveMentions,
 } from './message-formatting.js'
-import { extractBtwPrefix } from './btw-prefix-detection.js'
+import { extractBtwSuffix } from './btw-prefix-detection.js'
 import { isVoiceAttachment } from './voice-attachment.js'
 import { forkSessionToBtwThread } from './commands/btw.js'
 import {
+  extractQueueSuffix,
+  getChannelReferencePermissionRules,
   preprocessExistingThreadMessage,
   preprocessNewThreadMessage,
 } from './message-preprocessing.js'
@@ -82,6 +84,7 @@ import { markDiscordGatewayReady, stopHranaServer } from './hrana-server.js'
 import { notifyError } from './sentry.js'
 import { flushDebouncedProcessCallbacks } from './debounced-process-flush.js'
 import { startRuntimeIdleSweeper } from './runtime-idle-sweeper.js'
+import { store } from './store.js'
 import {
   startExternalOpencodeSessionSync,
   stopExternalOpencodeSessionSync,
@@ -91,7 +94,6 @@ export {
   initDatabase,
   closeDatabase,
   getChannelDirectory,
-  getPrisma,
 } from './database.js'
 export { initializeOpencodeForDirectory } from './opencode.js'
 export {
@@ -254,6 +256,7 @@ export async function createDiscordClient() {
   // Read REST API URL lazily so gateway mode can set store.discordBaseUrl
   // after module import but before client creation.
   const restApiUrl = getDiscordRestApiUrl()
+  const { allowedMentions } = store.getState()
   return new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -268,6 +271,7 @@ export async function createDiscordClient() {
       Partials.ThreadMember,
     ],
     rest: { api: restApiUrl },
+    allowedMentions: { parse: allowedMentions },
   })
 }
 
@@ -463,7 +467,8 @@ export async function startDiscordBot({
         isCliInjectedPrompt && message.author?.id === discordClient.user?.id
 
       if (message.author?.bot && !isInjectedSelfBotMessage) {
-        if (!hasKimakiBotPermission(message.member)) {
+        const member = await resolveGuildMessageMember(message)
+        if (!hasKimakiBotPermission(member, message.guild)) {
           return
         }
       }
@@ -510,8 +515,13 @@ export async function startDiscordBot({
         }
       }
 
-      if (!isCliInjectedPrompt && message.guild && message.member) {
-        if (hasNoKimakiRole(message.member)) {
+      if (!isCliInjectedPrompt && message.guild) {
+        const member = await resolveGuildMessageMember(message)
+        if (!member) {
+          return
+        }
+
+        if (hasNoKimakiRole(member)) {
           await message.reply({
             content: `You have the **no-kimaki** role which blocks bot access.\nRemove this role to use Kimaki.`,
             flags: SILENT_MESSAGE_FLAGS,
@@ -519,7 +529,7 @@ export async function startDiscordBot({
           return
         }
 
-        if (!hasKimakiBotPermission(message.member)) {
+        if (!hasKimakiBotPermission(member, message.guild)) {
           await message.reply({
             content: `You don't have permission to start sessions.\nTo use Kimaki, ask a server admin to give you the **Kimaki** role.`,
             flags: SILENT_MESSAGE_FLAGS,
@@ -637,19 +647,18 @@ export async function startDiscordBot({
           }
         }
 
-        // Raw `btw ` mirrors /btw for fast side-question forks from Discord.
-        // Keep this at ingress instead of preprocess because it must create a
-        // new thread/runtime, not just transform the current prompt.
-        // Voice-transcribed `btw` still goes through normal preprocessing.
-        const btwShortcut =
+        // `. btw` suffix mirrors /btw for fast side-question forks.
+        // Works like queue: just the word "btw" at the end after punctuation
+        // or newline. The whole message (minus the suffix) becomes the fork prompt.
+        const btwResult =
           projectDirectory && worktreeInfo?.status !== 'pending'
-            ? extractBtwPrefix(message.content || '')
+            ? extractBtwSuffix(message.content || '')
             : null
-        if (btwShortcut && projectDirectory) {
+        if (btwResult?.forceBtw && projectDirectory) {
           const result = await forkSessionToBtwThread({
             sourceThread: thread,
             projectDirectory,
-            prompt: btwShortcut.prompt,
+            prompt: btwResult.prompt,
             userId: message.author.id,
             username:
               message.member?.displayName || message.author.displayName,
@@ -857,9 +866,21 @@ export async function startDiscordBot({
               .replace(/\s+/g, ' ')
               .trim() || 'kimaki thread'
 
-        // Check if worktrees should be enabled (CLI flag OR channel setting)
-        const shouldUseWorktrees =
+        // Check if worktrees should be enabled (CLI flag OR channel setting).
+        // Only create worktrees from the configured project directory when that
+        // directory is itself the git root. If the user registered a non-git
+        // workspace folder under a larger repo, git would create the worktree
+        // from the parent repo and strand follow-up messages on failure.
+        const wantsWorktrees =
           useWorktrees || (await getChannelWorktreesEnabled(channel.id))
+        const shouldUseWorktrees =
+          wantsWorktrees && (await isGitRepositoryRoot(projectDirectory))
+
+        if (wantsWorktrees && !shouldUseWorktrees) {
+          discordLogger.warn(
+            `[WORKTREE] Skipping automatic worktree for non-git project directory: ${projectDirectory}`,
+          )
+        }
 
         // Add worktree prefix if worktrees are enabled
         const threadName = shouldUseWorktrees
@@ -968,6 +989,59 @@ export async function startDiscordBot({
     }
   })
 
+  // Handle user message edits to update queued messages.
+  // When a user edits a message that is still waiting in kimaki's local queue,
+  // the queue item is updated with the new content. If the edit removes the
+  // queue suffix, the item is removed from the queue.
+  discordClient.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
+    try {
+      // Fetch full message if partial (cache miss). Needed for mentions
+      // and content to be fully resolved.
+      const message = newMessage.partial
+        ? await newMessage.fetch().catch(() => null)
+        : newMessage
+      if (!message) return
+      if (message.author.bot) return
+      if (!message.content) return
+
+      const channel = message.channel
+      const isThread = [
+        ChannelType.PublicThread,
+        ChannelType.PrivateThread,
+        ChannelType.AnnouncementThread,
+      ].includes(channel.type)
+      if (!isThread) return
+
+      const runtime = getRuntime(channel.id)
+      if (!runtime) return
+
+      // Use resolveMentions to match initial preprocessing and preserve
+      // newlines (stripMentions collapses them, breaking final-line queue
+      // suffix detection).
+      const { prompt, forceQueue } = extractQueueSuffix(
+        resolveMentions(message),
+      )
+
+      // If the edit removed the queue suffix, remove the item from the queue.
+      // If the suffix is still present, update the prompt.
+      const result = runtime.updateQueuedMessage(
+        message.id,
+        forceQueue ? prompt : '',
+      )
+
+      if (result.found) {
+        discordLogger.log(
+          `[MESSAGE_EDIT] ${result.removed ? 'Removed' : 'Updated'} queued message ${message.id} in thread ${channel.id}`,
+        )
+      }
+    } catch (error) {
+      discordLogger.error(
+        'Error handling message update:',
+        error instanceof Error ? error.stack : String(error),
+      )
+    }
+  })
+
   // Handle bot-initiated threads created by `kimaki send` (without --notify-only)
   // Uses JSON embed marker to pass options (start, worktree name)
   discordClient.on(Events.ThreadCreate, async (thread, newlyCreated) => {
@@ -1062,7 +1136,7 @@ export async function startDiscordBot({
       // The runtime is created immediately so follow-up messages queue
       // naturally; the worktree promise is awaited inside enqueueIncoming.
       let worktreePromise: Promise<string | Error> | undefined
-      if (marker.worktree) {
+      if (marker.worktree && (await isGitRepositoryRoot(projectDirectory))) {
         discordLogger.log(`[BOT_SESSION] Creating worktree: ${marker.worktree}`)
 
         const worktreeStatusMessage = await thread
@@ -1079,17 +1153,20 @@ export async function startDiscordBot({
           projectDirectory,
           rest: discordClient.rest,
         })
+      } else if (marker.worktree) {
+        discordLogger.warn(
+          `[BOT_SESSION] Skipping requested worktree for non-git project directory: ${projectDirectory}`,
+        )
       }
 
-      // --cwd: reuse an existing worktree directory. Revalidate at bot-time
+      // --cwd: reuse an existing project subfolder or worktree directory. Revalidate at bot-time
       // (CLI validated at send-time but the path could become stale).
-      // Store in thread_worktrees as ready with origin=external so
-      // destructive actions (merge, delete) are gated.
+      // Only worktree directories are stored in thread_worktrees. Project
+      // subfolders simply become the OpenCode session directory.
       // --cwd: if it matches projectDirectory, ignore silently (already the default).
-      // Otherwise revalidate as a git worktree and store with origin=external.
       let cwdDirectory: string | undefined
       if (marker.cwd) {
-        const cwdResult = await validateWorktreeDirectory({
+        const cwdResult = await resolveSessionWorkingDirectory({
           projectDirectory,
           candidatePath: marker.cwd,
         })
@@ -1102,11 +1179,11 @@ export async function startDiscordBot({
           return
         }
 
-        // If cwd is the same as projectDirectory, skip worktree setup entirely
-        if (path.resolve(cwdResult) !== path.resolve(projectDirectory)) {
-          cwdDirectory = cwdResult
+        if (path.resolve(cwdResult.directory) !== path.resolve(projectDirectory)) {
+          cwdDirectory = cwdResult.directory
+        }
 
-
+        if (cwdResult.kind === 'worktree' && cwdDirectory) {
           // Resolve actual branch name instead of using directory basename
           const branchResult = await git(cwdDirectory, 'symbolic-ref --short HEAD')
           const cwdWorktreeName = branchResult instanceof Error
@@ -1181,7 +1258,10 @@ export async function startDiscordBot({
               newDirectory: cwdDirectory,
             })
           }
-          return { prompt, mode: 'opencode' }
+          const permissionRules = await getChannelReferencePermissionRules({
+            message: starterMessage,
+          })
+          return { prompt, permissionRules, mode: 'opencode' }
         },
       })
     } catch (error) {

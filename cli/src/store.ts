@@ -4,7 +4,7 @@
 // See skills/zustand-centralized-state/SKILL.md for the pattern.
 
 import { createStore } from 'zustand/vanilla'
-import type { VerbosityLevel } from './generated/client.js'
+import type { VerbosityLevel } from './schema.js'
 import type { ThreadRunState } from './session-handler/thread-runtime-state.js'
 
 // Registered user commands, populated by registerCommands() in cli.ts.
@@ -80,6 +80,28 @@ export type KimakiState = {
   // Read by: opencode.ts when building opencode-config.json.
   disabledSkills: string[]
 
+  // Which mention types the bot is allowed to trigger in messages.
+  // Maps directly to Discord's allowedMentions.parse array.
+  // Valid values: 'users', 'roles', 'everyone'.
+  // Changes: set once at startup from --allow-mention CLI flag.
+  // Read by: discord-bot.ts (Client constructor default), cli-runner.ts (raw REST calls).
+  allowedMentions: Array<'users' | 'roles' | 'everyone'>
+
+  // When true, all Discord users can start sessions and use commands without
+  // needing the Kimaki role, Administrator, Manage Server, or being the owner.
+  // The "no-kimaki" role still blocks access even when this is enabled.
+  // Changes: set once at startup from --allow-all-users CLI flag.
+  // Read by: discord-utils.ts hasKimakiBotPermission().
+  allowAllUsers: boolean
+
+  // Whether background sync of external OpenCode sessions is enabled.
+  // When true (default), sessions started from the OpenCode CLI or TUI
+  // are mirrored into Discord threads so they can be browsed, searched,
+  // and resumed from Discord. Set to false via --disable-sync CLI flag.
+  // Changes: set once at startup.
+  // Read by: external-opencode-sync.ts startExternalOpencodeSessionSync().
+  syncEnabled: boolean
+
   // Base URL for Discord REST API calls (default https://discord.com).
   // Overridden when using a gateway-proxy or gateway Discord mode.
   // Changes: set by getBotTokenWithMode() which runs at startup and on
@@ -131,6 +153,9 @@ export const store = createStore<KimakiState>(() => ({
   critiqueEnabled: true,
   enabledSkills: [],
   disabledSkills: [],
+  allowedMentions: ['users'],
+  allowAllUsers: false,
+  syncEnabled: true,
   discordBaseUrl: 'https://discord.com',
   gatewayToken: null,
   registeredUserCommands: [],

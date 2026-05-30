@@ -293,6 +293,29 @@ Resolution flow when `tsc` sees `import db from '#sqlite'`:
 - **Bun / browser runtime conditions can still point at `src`**, because
   those runtimes execute `.ts` directly and skip the build step.
 
+### Excluding heavy dependencies from server/client bundles
+
+`imports` conditions can swap a heavy client-only dependency for a lightweight
+noop stub on the server (or vice versa). This keeps the SSR bundle small
+without changing application code.
+
+```json
+{
+  "imports": {
+    "#prism": {
+      "types": "./dist/prism.d.ts",
+      "ssr": "./dist/prism-noop.js",
+      "browser": "./dist/prism.js",
+      "default": "./dist/prism.js"
+    }
+  }
+}
+```
+
+`src/prism.ts` imports the real library (~500KB). `src/prism-noop.ts` exports
+the same interface with stub implementations that return input unchanged.
+Application code imports from `#prism` and gets the right version automatically.
+
 ### Requirements
 
 This only works when:
@@ -566,7 +589,7 @@ If the repo has Prisma schemas, add generate steps before tests:
 for the first section of readme use markup like this
 
 ```md
-<div align='center'>
+<div align='center' class='hidden'>
     <br/>
     <br/>
     <h3>projectname</h3>
@@ -580,7 +603,7 @@ there cannot be markdown inside the html.
 or a variant with a logo image:
 
 ```md
-<div align='center'>
+<div align='center' class='hidden'>
     <br/>
     <br/>
     <img src='https://genql.dev/banner.png' width='380px'>
@@ -595,6 +618,16 @@ or a variant with a logo image:
 
 > Notice the use of h3, not h1. and h4 for the tagline
 
+> `class='hidden'` is required to hide this if the README page is also imported in a holocron.so website. this way that html is only show in github readme and not holocron. which would display its own heading.
+
+if the README is being imported in holocron also follow holocron best practices like use of Aside and Note to highlight content. Non known github jsx tags are simply ignored by github which will still look fine. If you want to show a callback both in github and holocron you can use the callback syntax from github which works in both places:
+
+
+```
+> [!NOTE]
+> Useful information that users should know, even when skimming content.
+```
+
 ## .gitignore
 
 For non-workspace (standalone) packages, always create a `.gitignore` with:
@@ -607,6 +640,28 @@ dist
 ```
 
 Workspace packages inside a monorepo inherit the root `.gitignore`, so this only applies to standalone packages.
+
+## Peer dependencies
+
+Peer dependencies are installed by default by npm and pnpm. Use them to prevent a dependency from being duplicated in the consumer's `node_modules` tree. Common examples: `react`, `react-dom`, framework packages that must be singletons.
+
+To make peer dependencies optional, add `peerDependenciesMeta`:
+
+```json
+{
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0",
+    "sass": "^1.70.0",
+    "tsx": "^4.8.1"
+  },
+  "peerDependenciesMeta": {
+    "sass": { "optional": true },
+    "tsx": { "optional": true }
+  }
+}
+```
+
+`react` above is required (no meta entry), so consumers must install it. `sass` and `tsx` are optional; the package works without them but can use them if present.
 
 ## common mistakes
 

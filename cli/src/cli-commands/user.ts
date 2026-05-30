@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn, execSync } from 'node:child_process'
 import { createLogger, LogPrefix, initLogFile } from '../logger.js'
 import { createDiscordClient, initDatabase, getChannelDirectory, initializeOpencodeForDirectory, createProjectChannels } from '../discord-bot.js'
-import { getBotTokenWithMode, getThreadSession, getThreadIdBySessionId, getSessionEventSnapshot, getPrisma, createScheduledTask, listScheduledTasks, cancelScheduledTask, getScheduledTask, updateScheduledTask, getSessionStartSourcesBySessionIds, deleteChannelDirectoryById, findChannelsByDirectory } from '../database.js'
+import { getBotTokenWithMode, getThreadSession, getThreadIdBySessionId, getSessionEventSnapshot, createScheduledTask, listScheduledTasks, cancelScheduledTask, getScheduledTask, updateScheduledTask, getSessionStartSourcesBySessionIds, deleteChannelDirectoryById, findChannelsByDirectory } from '../database.js'
 import { ShareMarkdown } from '../markdown.js'
 import { parseSessionSearchPattern, findFirstSessionSearchHit, buildSessionSearchSnippet, getPartSearchTexts } from '../session-search.js'
 import { formatWorktreeName, formatAutoWorktreeName } from '../commands/new-worktree.js'
@@ -119,7 +119,7 @@ cli
 
 cli
   .command('tunnel', 'Expose a local port via tunnel')
-  .option('-p, --port <port>', 'Local port to expose (required)')
+  .option('-p, --port <port>', 'Local port to expose (optional when command output reveals one)')
   .option(
     '-t, --tunnel-id [id]',
     'Custom tunnel ID (only for services safe to expose publicly; prefer random default)',
@@ -128,24 +128,23 @@ cli
   .option('-s, --server [url]', 'Tunnel server URL')
   .option('-k, --kill', 'Kill any existing process on the port before starting')
   .action(async (options) => {
-      const { runTunnel, parseCommandFromArgv, CLI_NAME } = await import(
+      const { runTunnel, parseCommandFromArgv } = await import(
         'traforo/run-tunnel'
       )
+      const { command } = parseCommandFromArgv(process.argv)
 
-      if (!options.port) {
-        cliLogger.error('Error: --port is required')
-        cliLogger.error(`\nUsage: kimaki tunnel -p <port> [-- command]`)
+      if (!options.port && command.length === 0) {
+        cliLogger.error('Error: --port is required unless a command is provided after --')
+        cliLogger.error(`\nUsage: kimaki tunnel [-- command]`)
+        cliLogger.error(`   or: kimaki tunnel --port <port>`)
         process.exit(EXIT_NO_RESTART)
       }
 
-      const port = parseInt(options.port, 10)
-      if (isNaN(port) || port < 1 || port > 65535) {
+      const port = options.port ? parseInt(options.port, 10) : undefined
+      if (options.port && (!port || port < 1 || port > 65535)) {
         cliLogger.error(`Error: Invalid port number: ${options.port}`)
         process.exit(EXIT_NO_RESTART)
       }
-
-      // Parse command after -- from argv
-      const { command } = parseCommandFromArgv(process.argv)
 
       await runTunnel({
         port,

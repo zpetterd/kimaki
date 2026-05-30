@@ -78,6 +78,14 @@ cli
     '--auto-restart',
     'Automatically restart the bot on crash or OOM kill',
   )
+  .option(
+    '--allow-all-users',
+    'Allow all Discord users to start sessions without needing Kimaki role or admin permissions (no-kimaki role still blocks)',
+  )
+  .option(
+    '--disable-sync',
+    'Disable background sync of external OpenCode sessions into Discord',
+  )
   .option('--no-sentry', 'Disable Sentry error reporting')
   .option(
     '--gateway',
@@ -86,6 +94,15 @@ cli
   .option(
     '--gateway-callback-url <url>',
     'After gateway OAuth install, redirect to this URL instead of the default success page (appends ?guild_id=<id>)',
+  )
+  .option(
+    '--allow-mention <type>',
+    z
+      .array(z.enum(['users', 'roles', 'everyone']))
+      .optional()
+      .describe(
+        'Which mention types the bot can trigger (users, roles, everyone). Repeatable. Default: users only.',
+      ),
   )
   .option(
     '--enable-skill <name>',
@@ -117,10 +134,13 @@ cli
       verbosity?: string
       mentionMode?: boolean
       noCritique?: boolean
+      allowAllUsers?: boolean
+      disableSync?: boolean
       autoRestart?: boolean
       noSentry?: boolean
       gateway?: boolean
       gatewayCallbackUrl?: string
+      allowMention?: Array<'users' | 'roles' | 'everyone'>
       enableSkill?: string[]
       disableSkill?: string[]
     }) => {
@@ -226,8 +246,11 @@ cli
           }),
           ...(options.mentionMode && { defaultMentionMode: true }),
           ...(options.noCritique && { critiqueEnabled: false }),
+          ...(options.allowAllUsers && { allowAllUsers: true }),
+          ...(options.disableSync && { syncEnabled: false }),
           ...(enabledSkills.length > 0 && { enabledSkills }),
           ...(disabledSkills.length > 0 && { disabledSkills }),
+          ...(options.allowMention && { allowedMentions: options.allowMention }),
         })
 
         if (enabledSkills.length > 0) {
@@ -238,6 +261,12 @@ cli
         if (disabledSkills.length > 0) {
           cliLogger.log(
             `Skill blacklist enabled: [${disabledSkills.join(', ')}] will be hidden`,
+          )
+        }
+
+        if (options.allowAllUsers) {
+          cliLogger.log(
+            'Allow all users: any Discord member can start sessions (no-kimaki role still blocks)',
           )
         }
 
@@ -252,6 +281,11 @@ cli
         if (options.noCritique) {
           cliLogger.log(
             'Critique disabled: diffs will not be auto-uploaded to critique.work',
+          )
+        }
+        if (options.disableSync) {
+          cliLogger.log(
+            'Background sync disabled: external OpenCode sessions will not appear in Discord',
           )
         }
         if (options.noSentry) {
@@ -297,4 +331,4 @@ cli.use(maintenanceCommands)
 
 cli.version(getCurrentVersion())
 cli.help()
-cli.parse()
+void cli.parse()

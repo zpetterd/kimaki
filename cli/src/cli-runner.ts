@@ -40,8 +40,10 @@ import {
   setBotMode,
   setChannelDirectory,
   findChannelsByDirectory,
-  getPrisma,
+  getDb,
 } from './database.js'
+import * as orm from 'drizzle-orm'
+import * as dbSchema from './schema.js'
 import { selectResolvedCommand } from './opencode-command.js'
 import {
   Events,
@@ -180,7 +182,11 @@ export async function sendDiscordMessageWithOptionalAttachment({
   const discordMaxLength = 2000
   if (prompt.length <= discordMaxLength) {
     return (await rest.post(Routes.channelMessages(channelId), {
-      body: { content: prompt, embeds },
+      body: {
+        content: prompt,
+        embeds,
+        allowed_mentions: { parse: store.getState().allowedMentions },
+      },
     })) as { id: string }
   }
 
@@ -232,6 +238,7 @@ export async function sendDiscordMessageWithOptionalAttachment({
         content: summaryContent,
         attachments: [{ id: 0, filename: 'prompt.md' }],
         embeds,
+        allowed_mentions: { parse: store.getState().allowedMentions },
       }),
     )
     const buffer = fs.readFileSync(tmpFile)
@@ -482,8 +489,8 @@ export async function resolveGatewayInstallCredentials(): Promise<
     )
   }
 
-  const prisma = await getPrisma()
-  const gatewayBot = await prisma.bot_tokens.findUnique({
+  const db = await getDb()
+  const gatewayBot = await db.query.bot_tokens.findFirst({
     where: { app_id: KIMAKI_GATEWAY_APP_ID },
   })
 
@@ -721,6 +728,7 @@ export async function ensureCommandAvailable({
 // Run opencode upgrade in the background so the user always has the latest version.
 
 // Spawn caffeinate on macOS to prevent system sleep while bot is running.
+// Uses -s to also prevent sleep on lid close (AC power only, not battery).
 // Uses -w to watch the parent PID so caffeinate self-terminates if kimaki
 // exits for any reason (SIGTERM, crash, process.exit, supervisor stop).
 export function startCaffeinate() {
@@ -728,7 +736,7 @@ export function startCaffeinate() {
     return
   }
   try {
-    const proc = spawn('caffeinate', ['-i', '-w', String(process.pid)], {
+    const proc = spawn('caffeinate', ['-s', '-w', String(process.pid)], {
       stdio: 'ignore',
       detached: false,
     })
@@ -1016,7 +1024,7 @@ export async function resolveCredentials({
   // directly. This lets users switch back and forth between modes without
   // re-running the onboarding wizard each time.
   const hasGatewayCreds = (forceGateway && existingBot?.mode !== 'gateway')
-    ? await (await getPrisma()).bot_tokens.findUnique({
+    ? await (await getDb()).query.bot_tokens.findFirst({
         where: { app_id: KIMAKI_GATEWAY_APP_ID },
       })
     : undefined
@@ -1343,8 +1351,7 @@ export async function run({
   const forceRestartOnboarding = Boolean(restartOnboarding)
   const forceGateway = Boolean(gateway)
 
-  // Step 0: Ensure required CLI tools are installed (OpenCode + Bun).
-  // Run checks in parallel since they're independent `which` calls.
+  // Step 0: Ensure opencode and bun are installed
   await Promise.all([
     ensureCommandAvailable({
       name: 'opencode',
@@ -1448,10 +1455,9 @@ export async function run({
   // processes (send, upload-to-discord, project list) pick the correct bot.
   // getBotTokenWithMode() orders by last_used_at DESC as cross-process
   // source of truth.
-  await (await getPrisma()).bot_tokens.update({
-    where: { app_id: appId },
-    data: { last_used_at: new Date() },
-  })
+  await (await getDb()).update(dbSchema.bot_tokens)
+    .set({ last_used_at: new Date() })
+    .where(orm.eq(dbSchema.bot_tokens.app_id, appId))
 
   // skipChannelSetup: when true, skip interactive project/channel selection
   // and go straight to bot startup. Channel sync happens in the background.
@@ -1462,9 +1468,9 @@ export async function run({
   // and TTY is available, or user explicitly passed --add-channels.
   const isHeadlessGateway = isGatewayMode && !canUseInteractivePrompts()
   const hasConfiguredTextChannels = Boolean(
-    await (await getPrisma()).channel_directories.findFirst({
+    await (await getDb()).query.channel_directories.findFirst({
       where: { channel_type: 'text' },
-      select: { channel_id: true },
+      columns: { channel_id: true },
     }),
   )
   const skipChannelSetup = isHeadlessGateway || (() => {

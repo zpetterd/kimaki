@@ -38,9 +38,14 @@ import {
   setChannelVerbosity,
   setChannelAgent,
   setChannelModel,
+  getThreadSession,
+  getSessionAgent,
+  getChannelAgent,
   type VerbosityLevel,
 } from './database.js'
-import { getPrisma } from './db.js'
+import { getDb } from './db.js'
+import * as orm from 'drizzle-orm'
+import * as schema from './schema.js'
 import { startHranaServer, stopHranaServer } from './hrana-server.js'
 import { initializeOpencodeForDirectory, stopOpencodeServer } from './opencode.js'
 import {
@@ -335,6 +340,12 @@ describe('agent model resolution', () => {
           }),
         )
         .setDMPermission(false)
+        .addStringOption((opt) =>
+          opt
+            .setName('prompt')
+            .setDescription('Send a prompt with this agent')
+            .setRequired(false),
+        )
         .toJSON()
     })
     const rest = new REST({ version: '10', api: discord.restUrl }).setToken(
@@ -496,13 +507,9 @@ describe('agent model resolution', () => {
   test(
     'reply message injects replied-message context',
     async () => {
-      const prisma = await getPrisma()
-      await prisma.channel_agents.deleteMany({
-        where: { channel_id: TEXT_CHANNEL_ID },
-      })
-      await prisma.channel_models.deleteMany({
-        where: { channel_id: TEXT_CHANNEL_ID },
-      })
+      const db = await getDb()
+      await db.delete(schema.channel_agents).where(orm.eq(schema.channel_agents.channel_id, TEXT_CHANNEL_ID))
+      await db.delete(schema.channel_models).where(orm.eq(schema.channel_models.channel_id, TEXT_CHANNEL_ID))
 
       const existingThreadIds = new Set(
         (await discord.channel(TEXT_CHANNEL_ID).getThreads()).map((thread) => {
@@ -562,10 +569,8 @@ describe('agent model resolution', () => {
     'new thread uses channel model when channel model preference is set',
     async () => {
       // Clear channel agent so model resolution falls through to channel model
-      const prisma = await getPrisma()
-      await prisma.channel_agents.deleteMany({
-        where: { channel_id: TEXT_CHANNEL_ID },
-      })
+      const db = await getDb()
+      await db.delete(schema.channel_agents).where(orm.eq(schema.channel_agents.channel_id, TEXT_CHANNEL_ID))
 
       // Set channel model preference — simulates /model selecting a model at channel scope
       await setChannelModel({
@@ -629,10 +634,8 @@ describe('agent model resolution', () => {
     'channel model with variant preference completes without error',
     async () => {
       // Clear channel agent so model resolution falls through to channel model
-      const prisma = await getPrisma()
-      await prisma.channel_agents.deleteMany({
-        where: { channel_id: TEXT_CHANNEL_ID },
-      })
+      const db = await getDb()
+      await db.delete(schema.channel_agents).where(orm.eq(schema.channel_agents.channel_id, TEXT_CHANNEL_ID))
 
       // Set channel model with a variant (thinking level)
       // The deterministic provider doesn't support thinking, so the variant
@@ -795,14 +798,10 @@ describe('agent model resolution', () => {
     'thread created with no agent keeps default model after channel agent is set',
     async () => {
       // Clear any channel agent — thread starts with default (no agent)
-      const prisma = await getPrisma()
-      await prisma.channel_agents.deleteMany({
-        where: { channel_id: TEXT_CHANNEL_ID },
-      })
+      const db = await getDb()
+      await db.delete(schema.channel_agents).where(orm.eq(schema.channel_agents.channel_id, TEXT_CHANNEL_ID))
       // Also clear channel model so we get the pure default
-      await prisma.channel_models.deleteMany({
-        where: { channel_id: TEXT_CHANNEL_ID },
-      })
+      await db.delete(schema.channel_models).where(orm.eq(schema.channel_models.channel_id, TEXT_CHANNEL_ID))
 
       // 1. Send a message to create a thread (no channel agent set)
       await discord.channel(TEXT_CHANNEL_ID).user(TEST_USER_ID).sendMessage({
@@ -890,6 +889,114 @@ describe('agent model resolution', () => {
       // NOT the test-agent's model (AGENT_MODEL)
       expect(secondFooter!.content).toContain(DEFAULT_MODEL)
       expect(secondFooter!.content).not.toContain(AGENT_MODEL)
+    },
+    20_000,
+  )
+
+  test(
+    '/plan-agent with prompt starts a session with the plan agent',
+    async () => {
+      await setChannelAgent(TEXT_CHANNEL_ID, 'test-agent')
+
+      const prompt = 'Reply with exactly: inline-plan-agent-msg'
+      const { id: interactionId } = await discord
+        .channel(TEXT_CHANNEL_ID)
+        .user(TEST_USER_ID)
+        .runSlashCommand({
+          name: 'plan-agent',
+          options: [{ name: 'prompt', type: 3, value: prompt }],
+        })
+
+      await discord
+        .channel(TEXT_CHANNEL_ID)
+        .waitForInteractionAck({ interactionId, timeout: 4_000 })
+
+      const thread = await discord.channel(TEXT_CHANNEL_ID).waitForThread({
+        timeout: 4_000,
+        predicate: (t) => {
+          return t.name === prompt
+        },
+      })
+
+      await waitForFooterMessage({
+        discord,
+        threadId: thread.id,
+        timeout: 4_000,
+        afterMessageIncludes: 'ok',
+        afterAuthorId: discord.botUserId,
+      })
+
+      const sessionId = await getThreadSession(thread.id)
+      expect(sessionId).toBeDefined()
+      expect(sessionId ? await getSessionAgent(sessionId) : undefined).toBe('plan')
+      expect(await getChannelAgent(TEXT_CHANNEL_ID)).toBe('test-agent')
+      expect(await discord.thread(thread.id).text()).toMatchInlineSnapshot(`
+        "--- from: assistant (TestBot)
+        » **agent-model-tester** (plan): Reply with exactly: inline-plan-agent-msg
+        *using deterministic-provider/plan-model-v2 ⋅ plan*
+        ⬥ ok
+        *project ⋅ main ⋅ Ns ⋅ N% ⋅ plan-model-v2 ⋅ **plan***"
+      `)
+    },
+    20_000,
+  )
+
+  test(
+    '/plan-agent with prompt in an existing thread changes the session agent',
+    async () => {
+      await setChannelAgent(TEXT_CHANNEL_ID, 'test-agent')
+
+      await discord.channel(TEXT_CHANNEL_ID).user(TEST_USER_ID).sendMessage({
+        content: 'Reply with exactly: inline-existing-first-msg',
+      })
+
+      const thread = await discord.channel(TEXT_CHANNEL_ID).waitForThread({
+        timeout: 4_000,
+        predicate: (t) => {
+          return t.name === 'Reply with exactly: inline-existing-first-msg'
+        },
+      })
+
+      await waitForFooterMessage({
+        discord,
+        threadId: thread.id,
+        timeout: 4_000,
+        afterMessageIncludes: 'ok',
+        afterAuthorId: discord.botUserId,
+      })
+
+      const prompt = 'Reply with exactly: inline-existing-plan-msg'
+      const th = discord.thread(thread.id)
+      const { id: interactionId } = await th.user(TEST_USER_ID).runSlashCommand({
+        name: 'plan-agent',
+        options: [{ name: 'prompt', type: 3, value: prompt }],
+      })
+
+      await th.waitForInteractionAck({ interactionId, timeout: 4_000 })
+
+      await waitForFooterMessage({
+        discord,
+        threadId: thread.id,
+        timeout: 4_000,
+        afterMessageIncludes: 'inline-existing-plan-msg',
+        afterAuthorId: discord.botUserId,
+      })
+
+      const sessionId = await getThreadSession(thread.id)
+      expect(sessionId).toBeDefined()
+      expect(sessionId ? await getSessionAgent(sessionId) : undefined).toBe('plan')
+      expect(await getChannelAgent(TEXT_CHANNEL_ID)).toBe('test-agent')
+      expect(await th.text()).toMatchInlineSnapshot(`
+        "--- from: user (agent-model-tester)
+        Reply with exactly: inline-existing-first-msg
+        --- from: assistant (TestBot)
+        *using deterministic-provider/agent-model-v2 ⋅ test-agent*
+        ⬥ ok
+        *project ⋅ main ⋅ Ns ⋅ N% ⋅ agent-model-v2 ⋅ **test-agent***
+        » **agent-model-tester** (plan): Reply with exactly: inline-existing-plan-msg
+        ⬥ ok
+        *project ⋅ main ⋅ Ns ⋅ N% ⋅ plan-model-v2 ⋅ **plan***"
+      `)
     },
     20_000,
   )

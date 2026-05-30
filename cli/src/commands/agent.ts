@@ -1,5 +1,7 @@
 // /agent command - Set the preferred agent for this channel or session.
 // Also provides quick agent commands like /plan-agent, /build-agent that switch instantly.
+// When a prompt is provided to a quick agent command (e.g. /plan-agent "fix the bug"),
+// the prompt is sent with that agent and the session keeps that agent afterwards.
 
 import {
   ChatInputCommandInteraction,
@@ -7,8 +9,8 @@ import {
   StringSelectMenuBuilder,
   ActionRowBuilder,
   ChannelType,
+  ThreadAutoArchiveDuration,
   type ThreadChannel,
-  type TextChannel,
   MessageFlags,
 } from 'discord.js'
 import crypto from 'node:crypto'
@@ -21,7 +23,13 @@ import {
   getChannelAgent,
 } from '../database.js'
 import { initializeOpencodeForDirectory } from '../opencode.js'
-import { resolveTextChannel, getKimakiMetadata } from '../discord-utils.js'
+import {
+  resolveTextChannel,
+  resolveWorkingDirectory,
+  getKimakiMetadata,
+  SILENT_MESSAGE_FLAGS,
+} from '../discord-utils.js'
+import { getOrCreateRuntime } from '../session-handler/thread-session-runtime.js'
 import { createLogger, LogPrefix } from '../logger.js'
 import { getCurrentModelInfo } from './model.js'
 
@@ -260,7 +268,7 @@ export async function handleAgentCommand({
   interaction: ChatInputCommandInteraction
   appId: string
 }): Promise<void> {
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+  await interaction.deferReply()
 
   const context = await resolveAgentCommandContext({ interaction, appId })
   if (!context) {
@@ -416,8 +424,15 @@ export async function handleQuickAgentCommand({
   appId: string
 }): Promise<void> {
   const fallbackAgentName = command.commandName.replace(/-agent$/, '')
+  const prompt = command.options.getString('prompt') || undefined
 
-  await command.deferReply({ flags: MessageFlags.Ephemeral })
+  // Prompt mode: send the prompt with this agent immediately.
+  if (prompt) {
+    return handleQuickAgentWithPrompt({ command, appId, fallbackAgentName, prompt })
+  }
+
+  // No prompt: switch the persistent agent preference (original behavior).
+  await command.deferReply()
 
   const context = await resolveAgentCommandContext({
     interaction: command,
@@ -490,6 +505,134 @@ export async function handleQuickAgentCommand({
     agentLogger.error('Error in quick agent command:', error)
     await command.editReply({
       content: `Failed to switch agent: ${error instanceof Error ? error.message : 'Unknown error'}`,
+    })
+  }
+}
+
+/**
+ * Handle prompt mode: send a prompt with the requested agent.
+ * In a thread: enqueue the prompt on the existing session and switch that session.
+ * In a channel: create a new thread whose session starts with the requested agent.
+ * Channel-level preferences are not changed.
+ */
+async function handleQuickAgentWithPrompt({
+  command,
+  appId,
+  fallbackAgentName,
+  prompt,
+}: {
+  command: ChatInputCommandInteraction
+  appId: string
+  fallbackAgentName: string
+  prompt: string
+}): Promise<void> {
+  const channel = command.channel
+  if (!channel) {
+    await command.reply({
+      content: 'This command can only be used in a channel',
+      flags: MessageFlags.Ephemeral,
+    })
+    return
+  }
+
+  const resolvedAgentName =
+    (await resolveQuickAgentNameFromInteraction({ command })) ||
+    fallbackAgentName
+
+  const isThread = [
+    ChannelType.PublicThread,
+    ChannelType.PrivateThread,
+    ChannelType.AnnouncementThread,
+  ].includes(channel.type)
+
+  const displayText = `${prompt.slice(0, 1000)}${prompt.length > 1000 ? '...' : ''}`
+
+  if (isThread) {
+    // In a thread: enqueue the prompt and switch the existing session to this agent.
+    const thread = channel as ThreadChannel
+    const resolved = await resolveWorkingDirectory({ channel: thread })
+    if (!resolved) {
+      await command.reply({
+        content: 'Could not determine project directory for this channel',
+        flags: MessageFlags.Ephemeral,
+      })
+      return
+    }
+
+    const runtime = getOrCreateRuntime({
+      threadId: thread.id,
+      thread,
+      projectDirectory: resolved.projectDirectory,
+      sdkDirectory: resolved.workingDirectory,
+      channelId: thread.parentId || thread.id,
+      appId,
+    })
+
+    // Visible reply showing the one-shot prompt (not ephemeral, so it appears in thread).
+    await command.reply({
+      content: `» **${command.user.displayName}** (${resolvedAgentName}): ${displayText}`,
+      flags: SILENT_MESSAGE_FLAGS,
+    })
+
+    await runtime.enqueueIncoming({
+      prompt,
+      userId: command.user.id,
+      username: command.user.displayName,
+      agent: resolvedAgentName,
+      appId,
+      mode: 'opencode',
+    })
+  } else if (channel.type === ChannelType.GuildText) {
+    // In a channel: create a new thread and enqueue with the requested agent.
+    const metadata = await getKimakiMetadata(channel)
+    const projectDirectory = metadata.projectDirectory
+
+    if (!projectDirectory) {
+      await command.reply({
+        content: 'This channel is not configured with a project directory',
+        flags: MessageFlags.Ephemeral,
+      })
+      return
+    }
+
+    await command.deferReply()
+
+    const starterMessage = await channel.send({
+      content: `» **${command.user.displayName}** (${resolvedAgentName}): ${displayText}`,
+      flags: SILENT_MESSAGE_FLAGS,
+    })
+
+    const thread = await starterMessage.startThread({
+      name: prompt.slice(0, 80),
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      reason: `${resolvedAgentName} agent prompt`,
+    })
+
+    await thread.members.add(command.user.id)
+
+    await command.editReply(`Sent with **${resolvedAgentName}** agent in ${thread.toString()}`)
+
+    const runtime = getOrCreateRuntime({
+      threadId: thread.id,
+      thread,
+      projectDirectory,
+      sdkDirectory: projectDirectory,
+      channelId: channel.id,
+      appId,
+    })
+
+    await runtime.enqueueIncoming({
+      prompt,
+      userId: command.user.id,
+      username: command.user.displayName,
+      agent: resolvedAgentName,
+      appId,
+      mode: 'opencode',
+    })
+  } else {
+    await command.reply({
+      content: 'This command can only be used in text channels or threads',
+      flags: MessageFlags.Ephemeral,
     })
   }
 }

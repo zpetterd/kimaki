@@ -26,6 +26,7 @@ import { limitHeadingDepth } from './limit-heading-depth.js'
 import { unnestCodeBlocksFromLists } from './unnest-code-blocks.js'
 import { createLogger, LogPrefix } from './logger.js'
 import * as errore from 'errore'
+import { store } from './store.js'
 import mime from 'mime'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -49,6 +50,9 @@ export function hasKimakiBotPermission(
   if (hasNoKimakiRole) {
     return false
   }
+  if (store.getState().allowAllUsers) {
+    return true
+  }
   const memberPermissions =
     member instanceof GuildMember
       ? member.permissions
@@ -60,6 +64,55 @@ export function hasKimakiBotPermission(
   const canManageServer = memberPermissions.has(PermissionsBitField.Flags.ManageGuild)
   const hasKimakiRole = hasRoleByName(member, 'kimaki', guild)
   return isOwner || isAdmin || canManageServer || hasKimakiRole
+}
+
+/**
+ * Stricter permission check that ignores allowAllUsers.
+ * Use for admin-only commands like /login and /transcription-key that
+ * configure shared credentials. Always requires owner, admin, manage
+ * server, or Kimaki role regardless of --allow-all-users flag.
+ */
+export function hasKimakiAdminPermission(
+  member: GuildMemberType | APIInteractionGuildMember | null,
+  guild?: Guild | null,
+): boolean {
+  if (!member) {
+    return false
+  }
+  const hasNoKimaki = hasRoleByName(member, 'no-kimaki', guild)
+  if (hasNoKimaki) {
+    return false
+  }
+  const memberPermissions =
+    member instanceof GuildMember
+      ? member.permissions
+      : new PermissionsBitField(BigInt(member.permissions))
+  const ownerId = member instanceof GuildMember ? member.guild.ownerId : guild?.ownerId
+  const memberId = member instanceof GuildMember ? member.id : member.user.id
+  const isOwner = ownerId ? memberId === ownerId : false
+  const isAdmin = memberPermissions.has(PermissionsBitField.Flags.Administrator)
+  const canManageServer = memberPermissions.has(PermissionsBitField.Flags.ManageGuild)
+  const hasKimakiRole = hasRoleByName(member, 'kimaki', guild)
+  return isOwner || isAdmin || canManageServer || hasKimakiRole
+}
+
+export async function resolveGuildMessageMember(
+  message: Message,
+): Promise<GuildMemberType | null> {
+  if (!message.guild) return null
+  if (message.member) return message.member
+
+  const fetchedMember = await message.guild.members
+    .fetch(message.author.id)
+    .catch((e) => new Error('Failed to fetch guild member', { cause: e }))
+  if (fetchedMember instanceof Error) {
+    discordLogger.warn(
+      `[PERMISSION] Denying message ${message.id}: ${fetchedMember.message}`,
+    )
+    return null
+  }
+
+  return fetchedMember
 }
 
 function hasRoleByName(

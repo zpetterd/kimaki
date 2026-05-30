@@ -1,6 +1,12 @@
-import { PermissionsBitField } from 'discord.js'
-import { describe, expect, test } from 'vitest'
-import { hasKimakiBotPermission, splitMarkdownForDiscord } from './discord-utils.js'
+import { PermissionsBitField, type Message } from 'discord.js'
+import { afterEach, describe, expect, test } from 'vitest'
+import {
+  hasKimakiAdminPermission,
+  hasKimakiBotPermission,
+  resolveGuildMessageMember,
+  splitMarkdownForDiscord,
+} from './discord-utils.js'
+import { store } from './store.js'
 
 describe('splitMarkdownForDiscord', () => {
   test('never returns chunks over the max length with code fences', () => {
@@ -101,6 +107,47 @@ describe('splitMarkdownForDiscord', () => {
 })
 
 describe('hasKimakiBotPermission', () => {
+  afterEach(() => {
+    store.setState({ allowAllUsers: false })
+  })
+
+  test('allows any member when allowAllUsers is enabled', () => {
+    store.setState({ allowAllUsers: true })
+    const guild = {
+      ownerId: 'owner-id',
+      roles: { cache: new Map() },
+    } as any
+
+    const member = {
+      user: { id: 'member-id' },
+      permissions: '0',
+      roles: [],
+    } as any
+
+    expect(hasKimakiBotPermission(member, guild)).toBe(true)
+  })
+
+  test('still blocks no-kimaki role even when allowAllUsers is enabled', () => {
+    store.setState({ allowAllUsers: true })
+    const noKimakiRoleId = '222'
+    const guild = {
+      ownerId: 'owner-id',
+      roles: {
+        cache: new Map([
+          [noKimakiRoleId, { id: noKimakiRoleId, name: 'no-kimaki' }],
+        ]),
+      },
+    } as any
+
+    const member = {
+      user: { id: 'member-id' },
+      permissions: '0',
+      roles: [noKimakiRoleId],
+    } as any
+
+    expect(hasKimakiBotPermission(member, guild)).toBe(false)
+  })
+
   test('allows API interaction member when kimaki role exists', () => {
     const kimakiRoleId = '111'
     const guild = {
@@ -149,5 +196,99 @@ describe('hasKimakiBotPermission', () => {
     } as any
 
     expect(hasKimakiBotPermission(member, guild)).toBe(false)
+  })
+})
+
+describe('hasKimakiAdminPermission', () => {
+  afterEach(() => {
+    store.setState({ allowAllUsers: false })
+  })
+
+  test('denies unprivileged member even when allowAllUsers is enabled', () => {
+    store.setState({ allowAllUsers: true })
+    const guild = {
+      ownerId: 'owner-id',
+      roles: { cache: new Map() },
+    } as any
+
+    const member = {
+      user: { id: 'member-id' },
+      permissions: '0',
+      roles: [],
+    } as any
+
+    expect(hasKimakiAdminPermission(member, guild)).toBe(false)
+  })
+
+  test('allows admin even when allowAllUsers is enabled', () => {
+    store.setState({ allowAllUsers: true })
+    const guild = {
+      ownerId: 'owner-id',
+      roles: { cache: new Map() },
+    } as any
+
+    const member = {
+      user: { id: 'member-id' },
+      permissions: PermissionsBitField.Flags.Administrator.toString(),
+      roles: [],
+    } as any
+
+    expect(hasKimakiAdminPermission(member, guild)).toBe(true)
+  })
+})
+
+describe('resolveGuildMessageMember', () => {
+  test('uses hydrated message member without fetching', async () => {
+    const member = { id: 'member-id' }
+    const message = {
+      guild: {
+        members: {
+          fetch() {
+            throw new Error('should not fetch')
+          },
+        },
+      },
+      member,
+      author: { id: 'member-id' },
+      id: 'message-id',
+    } as unknown as Message
+
+    await expect(resolveGuildMessageMember(message)).resolves.toBe(member)
+  })
+
+  test('fetches missing guild message member', async () => {
+    const member = { id: 'member-id' }
+    const message = {
+      guild: {
+        members: {
+          fetch(id: string) {
+            expect(id).toBe('member-id')
+            return Promise.resolve(member)
+          },
+        },
+      },
+      member: null,
+      author: { id: 'member-id' },
+      id: 'message-id',
+    } as unknown as Message
+
+    await expect(resolveGuildMessageMember(message)).resolves.toBe(member)
+  })
+
+  test('denies when missing guild message member cannot be fetched', async () => {
+    const message = {
+      guild: {
+        members: {
+          fetch() {
+            return Promise.reject(new Error('missing member'))
+          },
+        },
+      },
+      member: null,
+      author: { id: 'member-id' },
+      id: 'message-id',
+    } as unknown as Message
+
+    await expect(resolveGuildMessageMember(message)).resolves.toBe(null)
   })
 })

@@ -28,6 +28,7 @@ import {
   closeDatabase,
   setChannelDirectory,
   setChannelVerbosity,
+  setChannelWorktreesEnabled,
   type VerbosityLevel,
 } from './database.js'
 import { startHranaServer, stopHranaServer } from './hrana-server.js'
@@ -45,6 +46,7 @@ import { execAsync } from './worktrees.js'
 
 const TEST_USER_ID = '200000000000000901'
 const TEXT_CHANNEL_ID = '200000000000000902'
+const NON_GIT_CHANNEL_ID = '200000000000000903'
 // Unique worktree name per run to avoid collisions with leftover worktrees
 const WORKTREE_SUFFIX = Date.now().toString(36).slice(-6)
 const WORKTREE_NAME = `wt-e2e-${WORKTREE_SUFFIX}`
@@ -54,8 +56,10 @@ function createRunDirectories() {
   fs.mkdirSync(root, { recursive: true })
   const dataDir = fs.mkdtempSync(path.join(root, 'data-'))
   const projectDirectory = path.join(root, 'project')
+  const nonGitDirectory = path.join(root, 'non-git-project')
   fs.mkdirSync(projectDirectory, { recursive: true })
-  return { root, dataDir, projectDirectory }
+  fs.mkdirSync(nonGitDirectory, { recursive: true })
+  return { root, dataDir, projectDirectory, nonGitDirectory }
 }
 
 function createDiscordJsClient({ restUrl }: { restUrl: string }) {
@@ -102,7 +106,7 @@ function createDeterministicMatchers(): DeterministicMatcher[] {
     priority: 10,
     when: {
       lastMessageRole: 'user',
-      rawPromptIncludes: 'Reply with exactly:',
+      latestUserTextIncludes: 'Reply with exactly:',
     },
     then: {
       parts: [
@@ -156,6 +160,11 @@ describe('worktree lifecycle', () => {
           name: 'worktree-e2e',
           type: ChannelType.GuildText,
         },
+        {
+          id: NON_GIT_CHANNEL_ID,
+          name: 'non-git-worktree-e2e',
+          type: ChannelType.GuildText,
+        },
       ],
       users: [
         {
@@ -194,6 +203,10 @@ describe('worktree lifecycle', () => {
       path.join(directories.projectDirectory, 'opencode.json'),
       JSON.stringify(opencodeConfig, null, 2),
     )
+    fs.writeFileSync(
+      path.join(directories.nonGitDirectory, 'opencode.json'),
+      JSON.stringify(opencodeConfig, null, 2),
+    )
 
     // Initialize git repo after writing opencode.json so the initial commit
     // includes it. Worktrees require at least one commit.
@@ -213,7 +226,14 @@ describe('worktree lifecycle', () => {
       directory: directories.projectDirectory,
       channelType: 'text',
     })
+    await setChannelDirectory({
+      channelId: NON_GIT_CHANNEL_ID,
+      directory: directories.nonGitDirectory,
+      channelType: 'text',
+    })
     await setChannelVerbosity(TEXT_CHANNEL_ID, 'tools_and_text')
+    await setChannelVerbosity(NON_GIT_CHANNEL_ID, 'tools_and_text')
+    await setChannelWorktreesEnabled(NON_GIT_CHANNEL_ID, true)
 
     botClient = createDiscordJsClient({ restUrl: discord.restUrl })
     await startDiscordBot({
@@ -278,7 +298,11 @@ describe('worktree lifecycle', () => {
         `git branch -D ${JSON.stringify(`opencode/kimaki-${WORKTREE_NAME}`)}`,
         { cwd: directories.projectDirectory },
       ).catch(() => { return })
-      fs.rmSync(directories.dataDir, { recursive: true, force: true })
+      fs.rmSync(directories.dataDir, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+      })
     }
   }, 5_000)
 
@@ -392,5 +416,72 @@ describe('worktree lifecycle', () => {
       expect(okCount).toBe(2)
     },
     30_000,
+  )
+
+  test(
+    'auto-worktrees fall back to normal sessions outside git repositories',
+    async () => {
+      await discord.channel(NON_GIT_CHANNEL_ID).user(TEST_USER_ID).sendMessage({
+        content: 'Reply with exactly: non-git-first',
+      })
+
+      const thread = await discord.channel(NON_GIT_CHANNEL_ID).waitForThread({
+        timeout: 4_000,
+        predicate: (t) => {
+          return Boolean(t.name?.includes('Reply with exactly: non-git-first'))
+        },
+      })
+
+      const th = discord.thread(thread.id)
+
+      await waitForBotReplyAfterUserMessage({
+        discord,
+        threadId: thread.id,
+        userId: TEST_USER_ID,
+        userMessageIncludes: 'non-git-first',
+        timeout: 4_000,
+      })
+
+      await th.user(TEST_USER_ID).sendMessage({
+        content: 'Reply with exactly: non-git-second',
+      })
+
+      await waitForBotMessageContaining({
+        discord,
+        threadId: thread.id,
+        userId: TEST_USER_ID,
+        text: '⬥ ok',
+        afterUserMessageIncludes: 'non-git-second',
+        timeout: 4_000,
+      })
+
+      let text = await th.text()
+      for (let attempt = 0; attempt < 40; attempt++) {
+        if ((text.match(/⬥ ok/g) || []).length >= 2) {
+          break
+        }
+        await new Promise((resolve) => {
+          setTimeout(resolve, 100)
+        })
+        text = await th.text()
+      }
+      expect(text).toMatchInlineSnapshot(`
+        "--- from: user (worktree-tester)
+        Reply with exactly: non-git-first
+        --- from: assistant (TestBot)
+        *using deterministic-provider/deterministic-v2*
+        --- from: user (worktree-tester)
+        Reply with exactly: non-git-second
+        --- from: assistant (TestBot)
+        ⬥ ok
+        ⬥ ok"
+      `)
+      expect(text).toContain('Reply with exactly: non-git-first')
+      expect(text).toContain('Reply with exactly: non-git-second')
+      expect(text).not.toContain('Worktree creation failed')
+      const okCount = (text.match(/⬥ ok/g) || []).length
+      expect(okCount).toBe(2)
+    },
+    20_000,
   )
 })

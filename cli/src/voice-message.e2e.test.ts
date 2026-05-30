@@ -865,6 +865,14 @@ e2eTest('voice message handling', () => {
         queueMessage: true,
       })
 
+      await waitForBotMessageContaining({
+        discord,
+        threadId: thread.id,
+        userId: TEST_USER_ID,
+        text: 'using deterministic-provider/deterministic-v2',
+        timeout: 4_000,
+      })
+
       await th.user(TEST_USER_ID).sendVoiceMessage()
 
       // 3. Transcription should appear, followed by queue notification

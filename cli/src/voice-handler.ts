@@ -18,9 +18,6 @@ import * as prism from 'prism-media'
 import dedent from 'string-dedent'
 import {
   Events,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   type Client,
   type Message,
   type ThreadChannel,
@@ -37,10 +34,10 @@ import {
 import {
   sendThreadMessage,
   escapeDiscordFormatting,
-  SILENT_MESSAGE_FLAGS,
   NOTIFY_MESSAGE_FLAGS,
   hasKimakiBotPermission,
 } from './discord-utils.js'
+import { showApiKeyRequiredButton } from './commands/gemini-apikey.js'
 import { transcribeAudio, type TranscriptionResult } from './voice.js'
 import { FetchError } from './errors.js'
 import { store } from './store.js'
@@ -317,99 +314,127 @@ export async function setupVoiceHandling({
   let speakingSessionCount = 0
 
   receiver.speaking.on('start', (userId) => {
-    voiceLogger.log(`User ${userId} started speaking`)
+    void (async () => {
+      voiceLogger.log(`User ${userId} started speaking`)
 
-    speakingSessionCount++
-    const currentSessionCount = speakingSessionCount
-    voiceLogger.log(`Speaking session ${currentSessionCount} started`)
+      const guild = discordClient.guilds.cache.get(guildId)
+      if (!guild) {
+        voiceLogger.warn(
+          `[VOICE] Ignoring speaker ${userId}: guild ${guildId} not cached`,
+        )
+        return
+      }
 
-    const audioStream = receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 500 },
-    })
-
-    const decoder = new prism.opus.Decoder({
-      rate: 48000,
-      channels: 2,
-      frameSize: 960,
-    })
-
-    decoder.on('error', (error) => {
-      voiceLogger.error(`Opus decoder error for user ${userId}:`, error)
-      void notifyError(error, `Opus decoder error for user ${userId}`)
-    })
-
-    const downsampleTransform = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        try {
-          const downsampled = convertToMono16k(chunk)
-          callback(null, downsampled)
-        } catch (error) {
-          callback(error as Error)
-        }
-      },
-    })
-
-    const framer = frameMono16khz()
-
-    const pipeline = audioStream
-      .pipe(decoder)
-      .pipe(downsampleTransform)
-      .pipe(framer)
-
-    pipeline
-      .on('data', (frame: Buffer) => {
-        if (currentSessionCount !== speakingSessionCount) {
-          return
-        }
-
-        if (!voiceData.genAiWorker) {
-          voiceLogger.warn(
-            `[VOICE] Received audio frame but no GenAI worker active for guild ${guildId}`,
-          )
-          return
-        }
-
-        voiceData.userAudioStream?.write(frame)
-
-        voiceData.genAiWorker.sendRealtimeInput({
-          audio: {
-            mimeType: 'audio/pcm;rate=16000',
-            data: frame.toString('base64'),
-          },
+      const member = await guild.members
+        .fetch(userId)
+        .catch((e) => {
+          return new Error('Failed to fetch voice speaker member', { cause: e })
         })
+      if (member instanceof Error) {
+        voiceLogger.warn(`[VOICE] Ignoring speaker ${userId}: ${member.message}`)
+        return
+      }
+
+      if (!hasKimakiBotPermission(member, guild)) {
+        voiceLogger.log(`[VOICE] Ignoring unauthorized speaker ${userId}`)
+        return
+      }
+
+      speakingSessionCount++
+      const currentSessionCount = speakingSessionCount
+      voiceLogger.log(`Speaking session ${currentSessionCount} started`)
+
+      const audioStream = receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.AfterSilence, duration: 500 },
       })
-      .on('end', () => {
-        if (currentSessionCount === speakingSessionCount) {
-          voiceLogger.log(
-            `User ${userId} stopped speaking (session ${currentSessionCount})`,
-          )
-          voiceData.genAiWorker?.sendRealtimeInput({
-            audioStreamEnd: true,
+
+      const decoder = new prism.opus.Decoder({
+        rate: 48000,
+        channels: 2,
+        frameSize: 960,
+      })
+
+      decoder.on('error', (error) => {
+        voiceLogger.error(`Opus decoder error for user ${userId}:`, error)
+        void notifyError(error, `Opus decoder error for user ${userId}`)
+      })
+
+      const downsampleTransform = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          try {
+            const downsampled = convertToMono16k(chunk)
+            callback(null, downsampled)
+          } catch (error) {
+            callback(error as Error)
+          }
+        },
+      })
+
+      const framer = frameMono16khz()
+
+      const pipeline = audioStream
+        .pipe(decoder)
+        .pipe(downsampleTransform)
+        .pipe(framer)
+
+      pipeline
+        .on('data', (frame: Buffer) => {
+          if (currentSessionCount !== speakingSessionCount) {
+            return
+          }
+
+          if (!voiceData.genAiWorker) {
+            voiceLogger.warn(
+              `[VOICE] Received audio frame but no GenAI worker active for guild ${guildId}`,
+            )
+            return
+          }
+
+          voiceData.userAudioStream?.write(frame)
+
+          voiceData.genAiWorker.sendRealtimeInput({
+            audio: {
+              mimeType: 'audio/pcm;rate=16000',
+              data: frame.toString('base64'),
+            },
           })
-        } else {
-          voiceLogger.log(
-            `User ${userId} stopped speaking (session ${currentSessionCount}), but skipping audioStreamEnd because newer session ${speakingSessionCount} exists`,
-          )
-        }
+        })
+        .on('end', () => {
+          if (currentSessionCount === speakingSessionCount) {
+            voiceLogger.log(
+              `User ${userId} stopped speaking (session ${currentSessionCount})`,
+            )
+            voiceData.genAiWorker?.sendRealtimeInput({
+              audioStreamEnd: true,
+            })
+          } else {
+            voiceLogger.log(
+              `User ${userId} stopped speaking (session ${currentSessionCount}), but skipping audioStreamEnd because newer session ${speakingSessionCount} exists`,
+            )
+          }
+        })
+        .on('error', (error) => {
+          voiceLogger.error(`Pipeline error for user ${userId}:`, error)
+          void notifyError(error, `Voice pipeline error for user ${userId}`)
+        })
+
+      audioStream.on('error', (error) => {
+        voiceLogger.error(`Audio stream error for user ${userId}:`, error)
+        void notifyError(error, `Audio stream error for user ${userId}`)
       })
-      .on('error', (error) => {
-        voiceLogger.error(`Pipeline error for user ${userId}:`, error)
-        void notifyError(error, `Voice pipeline error for user ${userId}`)
+
+      downsampleTransform.on('error', (error) => {
+        voiceLogger.error(`Downsample transform error for user ${userId}:`, error)
+        void notifyError(error, `Downsample transform error for user ${userId}`)
       })
 
-    audioStream.on('error', (error) => {
-      voiceLogger.error(`Audio stream error for user ${userId}:`, error)
-      void notifyError(error, `Audio stream error for user ${userId}`)
-    })
-
-    downsampleTransform.on('error', (error) => {
-      voiceLogger.error(`Downsample transform error for user ${userId}:`, error)
-      void notifyError(error, `Downsample transform error for user ${userId}`)
-    })
-
-    framer.on('error', (error) => {
-      voiceLogger.error(`Framer error for user ${userId}:`, error)
-      void notifyError(error, `Framer error for user ${userId}`)
+      framer.on('error', (error) => {
+        voiceLogger.error(`Framer error for user ${userId}:`, error)
+        void notifyError(error, `Framer error for user ${userId}`)
+      })
+    })().catch((error) => {
+      voiceLogger.error(`Error handling voice speaker ${userId}:`, error)
+      void notifyError(error, `Error handling voice speaker ${userId}`)
     })
   })
 }
@@ -593,18 +618,10 @@ export async function processVoiceAttachment({
 
   if (!transcriptionApiKey) {
     if (appId) {
-      const button = new ButtonBuilder()
-        .setCustomId(`transcription_apikey:${appId}`)
-        .setLabel('Set Transcription API Key')
-        .setStyle(ButtonStyle.Primary)
-
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(button)
-
-      await thread.send({
-        content:
-          'Voice transcription requires an API key (OpenAI or Gemini). Set one to enable voice message transcription.',
-        components: [row],
-        flags: SILENT_MESSAGE_FLAGS,
+      await showApiKeyRequiredButton({
+        thread,
+        appId,
+        message: 'Voice transcription requires an API key (OpenAI or Gemini). Set one to enable voice message transcription.',
       })
     } else {
       await sendThreadMessage(

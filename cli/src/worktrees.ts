@@ -800,6 +800,14 @@ export async function isDirty(
   return status.length > 0
 }
 
+export async function isGitRepositoryRoot(directory: string): Promise<boolean> {
+  const topLevel = await git(directory, 'rev-parse --show-toplevel')
+  if (topLevel instanceof Error) {
+    return false
+  }
+  return path.resolve(topLevel) === path.resolve(directory)
+}
+
 async function getGitCommonDir(dir: string): Promise<GitCommandError | string> {
   const commonDir = await git(dir, 'rev-parse --git-common-dir')
   if (commonDir instanceof Error) {
@@ -1202,6 +1210,70 @@ export async function validateWorktreeDirectory({
   }
 
   return absoluteCandidate
+}
+
+export type SessionWorkingDirectory = {
+  kind: 'project' | 'worktree'
+  directory: string
+}
+
+function isSameOrInsideDirectory({
+  parentDirectory,
+  candidateDirectory,
+}: {
+  parentDirectory: string
+  candidateDirectory: string
+}) {
+  const relativePath = path.relative(parentDirectory, candidateDirectory)
+  return (
+    relativePath === '' ||
+    (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))
+  )
+}
+
+export async function resolveSessionWorkingDirectory({
+  projectDirectory,
+  candidatePath,
+}: {
+  projectDirectory: string
+  candidatePath: string
+}): Promise<SessionWorkingDirectory | Error> {
+  const absoluteProjectDirectory = path.resolve(projectDirectory)
+  const absoluteCandidate = path.resolve(candidatePath)
+
+  const stat = await fs.promises.stat(absoluteCandidate).catch((error) => {
+    return new Error(`Directory does not exist: ${absoluteCandidate}`, {
+      cause: error,
+    })
+  })
+  if (stat instanceof Error) {
+    return stat
+  }
+  if (!stat.isDirectory()) {
+    return new Error(`Path is not a directory: ${absoluteCandidate}`)
+  }
+
+  if (
+    isSameOrInsideDirectory({
+      parentDirectory: absoluteProjectDirectory,
+      candidateDirectory: absoluteCandidate,
+    })
+  ) {
+    return { kind: 'project', directory: absoluteCandidate }
+  }
+
+  const worktreeResult = await validateWorktreeDirectory({
+    projectDirectory: absoluteProjectDirectory,
+    candidatePath: absoluteCandidate,
+  })
+  if (worktreeResult instanceof Error) {
+    return new Error(
+      `Working directory must be inside ${absoluteProjectDirectory} or a git worktree of it: ${absoluteCandidate}`,
+      { cause: worktreeResult },
+    )
+  }
+
+  return { kind: 'worktree', directory: worktreeResult }
 }
 
 // Parsed entry from `git worktree list --porcelain`.

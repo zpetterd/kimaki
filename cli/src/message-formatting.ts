@@ -3,7 +3,7 @@
 // handles file attachments, and provides tool summary generation.
 
 import type { Part, FilePartInput } from '@opencode-ai/sdk/v2'
-import type { Message, TextChannel } from 'discord.js'
+import type { Embed, Message, MessageSnapshot, Poll, TextChannel } from 'discord.js'
 
 // Extended FilePartInput with original Discord URL for reference in prompts
 export type DiscordFileAttachment = FilePartInput & {
@@ -24,8 +24,89 @@ type GenericSessionMessage = {
 const logger = createLogger(LogPrefix.FORMATTING)
 
 /**
+ * Serialize Discord embeds into plain text so the AI model can read them.
+ * Each embed becomes an <embed> XML block with title, author, description,
+ * fields, footer, and URL when present.
+ */
+export function serializeEmbeds(embeds: Embed[]): string {
+  if (embeds.length === 0) return ''
+  const parts: string[] = []
+  for (const embed of embeds) {
+    const lines: string[] = []
+    if (embed.author?.name) {
+      lines.push(`Author: ${embed.author.name}`)
+    }
+    if (embed.title) {
+      lines.push(`Title: ${embed.title}`)
+    }
+    if (embed.url) {
+      lines.push(`URL: ${embed.url}`)
+    }
+    if (embed.description) {
+      lines.push(embed.description)
+    }
+    for (const field of embed.fields) {
+      lines.push(`${field.name}: ${field.value}`)
+    }
+    if (embed.footer?.text) {
+      lines.push(`Footer: ${embed.footer.text}`)
+    }
+    if (lines.length > 0) {
+      parts.push(`<embed>\n${lines.join('\n')}\n</embed>`)
+    }
+  }
+  return parts.join('\n\n')
+}
+
+/**
+ * Serialize a Discord poll into plain text so the AI model can read the
+ * question and answer options.
+ */
+export function serializePoll(poll: Poll | null): string {
+  if (!poll) return ''
+  const lines: string[] = []
+  if (poll.question.text) {
+    lines.push(`Question: ${poll.question.text}`)
+  }
+  for (const [, answer] of poll.answers) {
+    if (answer.text) {
+      lines.push(`- ${answer.text}`)
+    }
+  }
+  if (lines.length === 0) return ''
+  return `<poll>\n${lines.join('\n')}\n</poll>`
+}
+
+/**
+ * Serialize forwarded message snapshots into plain text. Each snapshot is a
+ * partial Message with content and embeds.
+ */
+export function serializeMessageSnapshots(
+  snapshots: Message['messageSnapshots'],
+): string {
+  if (snapshots.size === 0) return ''
+  const parts: string[] = []
+  for (const [, snapshot] of snapshots) {
+    const lines: string[] = []
+    if (snapshot.content) {
+      lines.push(snapshot.content)
+    }
+    if (snapshot.embeds.length > 0) {
+      const embedText = serializeEmbeds(snapshot.embeds)
+      if (embedText) lines.push(embedText)
+    }
+    if (lines.length > 0) {
+      parts.push(`<forwarded-message>\n${lines.join('\n\n')}\n</forwarded-message>`)
+    }
+  }
+  return parts.join('\n\n')
+}
+
+/**
  * Resolves Discord mentions in message content to human-readable names.
  * Replaces <@userId> with @displayName, <@&roleId> with @roleName, <#channelId> with #channelName.
+ * Appends serialized embeds, polls, and forwarded message snapshots so the AI
+ * model can see all user-visible content.
  */
 export function resolveMentions(message: Message): string {
   let content = message.content || ''
@@ -49,6 +130,17 @@ export function resolveMentions(message: Message): string {
   for (const [channelId, channel] of message.mentions.channels) {
     const name = 'name' in channel ? (channel as TextChannel).name : channelId
     content = content.replace(new RegExp(`<#${channelId}>`, 'g'), `#${name}`)
+  }
+
+  // Append non-text content so the model can see it
+  const extras = [
+    serializeEmbeds(message.embeds),
+    serializePoll(message.poll),
+    serializeMessageSnapshots(message.messageSnapshots),
+  ].filter(Boolean)
+  if (extras.length > 0) {
+    const joined = extras.join('\n\n')
+    content = content ? `${content}\n\n${joined}` : joined
   }
 
   return content

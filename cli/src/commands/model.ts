@@ -35,6 +35,29 @@ import { buildPaginatedOptions, parsePaginationValue } from './paginated-select.
 
 const modelLogger = createLogger(LogPrefix.MODEL)
 
+function buildSafeSelectOption({
+  label,
+  value,
+  description,
+}: {
+  label: string | undefined
+  value: string | undefined
+  description?: string
+}) {
+  const trimmedLabel = label?.trim()
+  const trimmedValue = value?.trim()
+  const safeLabel = (trimmedLabel || trimmedValue || 'Unknown').slice(0, 100)
+  const safeValue = trimmedValue || trimmedLabel || ''
+  if (!safeLabel || !safeValue) {
+    return undefined
+  }
+  return {
+    label: safeLabel,
+    value: safeValue,
+    description: description?.slice(0, 100),
+  }
+}
+
 // Store context by hash to avoid customId length limits (Discord max: 100 chars).
 // Entries are TTL'd to prevent unbounded growth when users open /model and never
 // interact with the select menu.
@@ -336,7 +359,7 @@ export async function handleModelCommand({
   modelLogger.log('[MODEL] handleModelCommand called')
 
   // Defer reply immediately to avoid 3-second timeout
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+  await interaction.deferReply()
   modelLogger.log('[MODEL] Deferred reply')
 
   const channel = interaction.channel
@@ -489,19 +512,16 @@ export async function handleModelCommand({
     setModelContext(contextHash, context)
 
     const allProviderOptions = [...availableProviders]
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))
       .map((provider) => {
         const modelCount = Object.keys(provider.models || {}).length
-        return {
-          label: provider.name.slice(0, 100),
+        return buildSafeSelectOption({
+          label: provider.name,
           value: provider.id,
-          description:
-            `${modelCount} model${modelCount !== 1 ? 's' : ''} available`.slice(
-              0,
-              100,
-            ),
-        }
+          description: `${modelCount} model${modelCount !== 1 ? 's' : ''} available`,
+        })
       })
+      .filter((option): option is NonNullable<typeof option> => !!option)
 
     const { options } = buildPaginatedOptions({
       allOptions: allProviderOptions,
@@ -583,15 +603,16 @@ export async function handleProviderSelectMenu(
     const { all: allProviders, connected } = providersResponse.data
     const availableProviders = allProviders.filter((p) => connected.includes(p.id))
     const allProviderOptions = [...availableProviders]
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))
       .map((p) => {
         const modelCount = Object.keys(p.models || {}).length
-        return {
-          label: p.name.slice(0, 100),
+        return buildSafeSelectOption({
+          label: p.name,
           value: p.id,
-          description: `${modelCount} model${modelCount !== 1 ? 's' : ''} available`.slice(0, 100),
-        }
+          description: `${modelCount} model${modelCount !== 1 ? 's' : ''} available`,
+        })
       })
+      .filter((option): option is NonNullable<typeof option> => !!option)
     const { options } = buildPaginatedOptions({ allOptions: allProviderOptions, page: providerNavPage })
     const selectMenu = new StringSelectMenuBuilder()
       .setCustomId(`model_provider:${contextHash}`)
@@ -642,10 +663,11 @@ export async function handleProviderSelectMenu(
     const models = Object.entries(provider.models || {})
       .map(([modelId, model]) => ({
         id: modelId,
-        name: model.name,
+        name: model.name || modelId,
         releaseDate: model.release_date,
       }))
-      .sort((a, b) => a.name.localeCompare(b.name))
+      .filter((model) => model.id && model.name)
+      .sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))
 
     if (models.length === 0) {
       await interaction.editReply({
@@ -657,20 +679,22 @@ export async function handleProviderSelectMenu(
 
     // Update context with provider info and reuse the same hash
     context.providerId = selectedProviderId
-    context.providerName = provider.name
+    context.providerName = provider.name?.trim() || provider.id
     context.modelPage = 0
     setModelContext(contextHash, context)
 
-    const allModelOptions = models.map((model) => {
-      const dateStr = model.releaseDate
-        ? new Date(model.releaseDate).toLocaleDateString()
-        : 'Unknown date'
-      return {
-        label: model.name.slice(0, 100),
-        value: model.id,
-        description: dateStr.slice(0, 100),
-      }
-    })
+    const allModelOptions = models
+      .map((model) => {
+        const dateStr = model.releaseDate
+          ? new Date(model.releaseDate).toLocaleDateString()
+          : 'Unknown date'
+        return buildSafeSelectOption({
+          label: model.name,
+          value: model.id,
+          description: dateStr,
+        })
+      })
+      .filter((option): option is NonNullable<typeof option> => !!option)
 
     const { options } = buildPaginatedOptions({
       allOptions: allModelOptions,
@@ -752,14 +776,16 @@ export async function handleModelSelectMenu(
       return
     }
     const allModelOptions = Object.entries(provider.models || {})
-      .map(([modelId, model]) => ({
-        label: model.name.slice(0, 100),
-        value: modelId,
-        description: (model.release_date
-          ? new Date(model.release_date).toLocaleDateString()
-          : 'Unknown date'
-        ).slice(0, 100),
-      }))
+      .map(([modelId, model]) =>
+        buildSafeSelectOption({
+          label: model.name || modelId,
+          value: modelId,
+          description: model.release_date
+            ? new Date(model.release_date).toLocaleDateString()
+            : 'Unknown date',
+        }),
+      )
+      .filter((option): option is NonNullable<typeof option> => !!option)
       .sort((a, b) => a.label.localeCompare(b.label))
     const { options } = buildPaginatedOptions({ allOptions: allModelOptions, page: modelNavPage })
     const selectMenu = new StringSelectMenuBuilder()
@@ -979,7 +1005,7 @@ export async function handleModelScopeSelectMenu(
   const variant = context.selectedVariant ?? null
   const variantSuffix = variant ? ` (${variant})` : ''
   const agentTip =
-    '\n_Tip: create [agent .md files](https://github.com/remorses/kimaki/blob/main/docs/model-switching.md) in .opencode/agent/ for one-command model switching_'
+    '\n_Tip: create [agent .md files](https://kimaki.dev/docs/model-switching) in .opencode/agent/ for one-command model switching_'
 
   try {
     if (selectedScope === 'session') {

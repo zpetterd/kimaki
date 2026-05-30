@@ -117,7 +117,7 @@ import {
   handleVariantQuickSelectMenu,
   handleVariantScopeSelectMenu,
 } from './commands/model-variant.js'
-import { hasKimakiBotPermission } from './discord-utils.js'
+import { hasKimakiAdminPermission, hasKimakiBotPermission } from './discord-utils.js'
 import { createLogger, LogPrefix } from './logger.js'
 import { notifyError } from './sentry.js'
 
@@ -147,6 +147,11 @@ export function registerInteractionHandler({
         )
 
         if (interaction.isAutocomplete()) {
+          if (!hasKimakiBotPermission(interaction.member, interaction.guild)) {
+            await interaction.respond([])
+            return
+          }
+
           switch (interaction.commandName) {
             case 'new-session':
               await handleSessionAutocomplete({ interaction, appId })
@@ -301,6 +306,13 @@ export function registerInteractionHandler({
               return
 
             case 'login':
+              if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+                await interaction.reply({
+                  content: `Only server admins or users with the **Kimaki** role can configure login credentials.`,
+                  flags: MessageFlags.Ephemeral,
+                })
+                return
+              }
               await handleLoginCommand({ interaction, appId })
               return
 
@@ -361,6 +373,13 @@ export function registerInteractionHandler({
               return
 
             case 'transcription-key':
+              if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+                await interaction.reply({
+                  content: `Only server admins or users with the **Kimaki** role can configure API keys.`,
+                  flags: MessageFlags.Ephemeral,
+                })
+                return
+              }
               await handleTranscriptionApiKeyCommand({
                 interaction,
                 appId,
@@ -420,6 +439,13 @@ export function registerInteractionHandler({
           const customId = interaction.customId
 
           if (customId.startsWith('transcription_apikey:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure API keys.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleTranscriptionApiKeyButton(interaction)
             return
           }
@@ -439,16 +465,37 @@ export function registerInteractionHandler({
           }
 
           if (customId.startsWith('login_text_btn:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure login credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleLoginTextButton(interaction)
             return
           }
 
           if (customId.startsWith('login_apikey_btn:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure login credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleLoginApiKeyButton(interaction)
             return
           }
 
           if (customId.startsWith('login_oauth_code_btn:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure login credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleOAuthCodeButton(interaction)
             return
           }
@@ -538,6 +585,13 @@ export function registerInteractionHandler({
           }
 
           if (customId.startsWith('login_select:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure login credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleLoginSelect(interaction)
             return
           }
@@ -556,21 +610,49 @@ export function registerInteractionHandler({
           const customId = interaction.customId
 
           if (customId.startsWith('login_apikey:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleApiKeyModalSubmit(interaction)
             return
           }
 
           if (customId.startsWith('login_text:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleLoginTextModalSubmit(interaction)
             return
           }
 
           if (customId.startsWith('login_oauth_code:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleOAuthCodeModalSubmit(interaction)
             return
           }
 
           if (customId.startsWith('transcription_apikey_modal:')) {
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
             await handleTranscriptionApiKeyModalSubmit(interaction)
             return
           }

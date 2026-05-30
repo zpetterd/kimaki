@@ -1,23 +1,19 @@
-// Detects the raw `btw ` Discord message shortcut used to fork a side-question
-// thread without invoking the /btw slash command UI.
+// Detects `. btw` suffix at the end of a Discord message, identical pattern
+// to the queue suffix. When present the suffix is stripped and the remaining
+// message is forked to a new btw thread via /btw.
+//
+// Supported forms:
+// - punctuation + btw: ". btw", "! btw", ". btw.", "!btw."
+// - btw as its own final line: "text\nbtw"
+// Non-matches: "btw fix this" (start only), "hello btw" (no punctuation)
 
-export function extractBtwPrefix(
+const BTW_SUFFIX_RE = /(?:[.!?,;:])\s*btw\.?\s*$|\n\s*btw\.?\s*$/i
+
+export function extractBtwSuffix(
   content: string,
-): { prompt: string } | null {
-  if (!content) {
-    return null
+): { prompt: string; forceBtw: boolean } {
+  if (!BTW_SUFFIX_RE.test(content)) {
+    return { prompt: content, forceBtw: false }
   }
-
-  // Match "btw" followed by whitespace or punctuation (. , : ; ! ?) then the prompt
-  const match = content.match(/^\s*btw[.,;:!?\s]\s*([\s\S]+)$/i)
-  if (!match) {
-    return null
-  }
-
-  const prompt = match[1]?.trim()
-  if (!prompt) {
-    return null
-  }
-
-  return { prompt }
+  return { prompt: content.replace(BTW_SUFFIX_RE, '').trimEnd(), forceBtw: true }
 }

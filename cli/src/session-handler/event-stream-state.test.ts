@@ -7,6 +7,7 @@ import type { Message as OpenCodeMessage } from '@opencode-ai/sdk/v2'
 import { describe, expect, test } from 'vitest'
 import { type OpencodeEventLogEntry } from './opencode-session-event-log.js'
 import {
+  derivePendingPermissionRequests,
   getAssistantMessageIdsForLatestUserTurn,
   getDerivedSubagentSessions,
   getEventBufferSessionId,
@@ -77,6 +78,19 @@ function getAssistantMessageById({
     throw new Error(`Assistant message ${messageId} not found`)
   }
   return message
+}
+
+// Test fixtures omit the top-level event `id` for brevity. The SDK event types
+// require it, so inject a synthetic id when missing. Derivation never reads the
+// top-level id (only properties.id / info.id), so the value is irrelevant.
+let syntheticEventIdCounter = 0
+function eventEntry(
+  event: Omit<EventBufferEntry['event'], 'id'> & { id?: string },
+): EventBufferEntry {
+  const withId = ('id' in event && event.id
+    ? event
+    : { ...event, id: `evt_${++syntheticEventIdCounter}` }) as EventBufferEntry['event']
+  return { event: withId, timestamp: 1 }
 }
 
 function findAssistantCompletionEventIndex({
@@ -157,6 +171,50 @@ describe('session-normal-completion', () => {
       agent: 'build',
       tokensUsed: 2,
     })
+  })
+})
+
+describe('derivePendingPermissionRequests', () => {
+  test('tracks unresolved permission requests', () => {
+    const sessionId = 'ses_pending_permission'
+    const events = [
+      eventEntry({
+        type: 'permission.asked',
+        properties: {
+          id: 'perm_1',
+          sessionID: sessionId,
+          permission: 'bash',
+          patterns: ['*'],
+          always: [],
+          metadata: {},
+        },
+      }),
+      eventEntry({
+        type: 'permission.asked',
+        properties: {
+          id: 'perm_2',
+          sessionID: sessionId,
+          permission: 'edit',
+          patterns: ['src/**'],
+          always: [],
+          metadata: {},
+        },
+      }),
+      eventEntry({
+        type: 'permission.replied',
+        properties: {
+          requestID: 'perm_1',
+          sessionID: sessionId,
+          reply: 'once',
+        },
+      }),
+    ]
+
+    expect(derivePendingPermissionRequests({ events, sessionId })).toMatchInlineSnapshot(`
+      [
+        "perm_2",
+      ]
+    `)
   })
 })
 
@@ -303,6 +361,7 @@ describe('synthetic-question-followup', () => {
     {
       timestamp: 1,
       event: {
+        id: 'evt_user_1',
         type: 'message.updated',
         properties: {
           sessionID: sessionId,
@@ -323,6 +382,7 @@ describe('synthetic-question-followup', () => {
     {
       timestamp: 2,
       event: {
+        id: 'evt_asst_1',
         type: 'message.updated',
         properties: {
           sessionID: sessionId,
@@ -352,6 +412,7 @@ describe('synthetic-question-followup', () => {
     {
       timestamp: 4,
       event: {
+        id: 'evt_user_2',
         type: 'message.updated',
         properties: {
           sessionID: sessionId,
