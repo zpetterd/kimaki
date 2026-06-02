@@ -144,9 +144,9 @@ export async function showAskUserQuestionDropdowns({
   }
 
   pendingQuestionContexts.set(contextHash, context)
-  // On TTL expiry: hide the dropdown UI and abort the session so OpenCode
-  // unblocks. We intentionally do NOT call question.reply() — sending 'Other'
-  // made the model think the user chose an option when they didn't.
+  // On TTL expiry: reply to the question tool so it completes, then abort the
+  // session so OpenCode unblocks. We use '_cancelled_' instead of a real
+  // option label so the model knows the user didn't choose anything.
   setTimeout(async () => {
     const ctx = pendingQuestionContexts.get(contextHash)
     if (!ctx) {
@@ -160,9 +160,21 @@ export async function showAskUserQuestionDropdowns({
       threadId: ctx.thread.id,
       requestId: ctx.requestId,
     })
-    // Abort the session so OpenCode isn't stuck waiting for a reply
     const client = getOpencodeClient(ctx.directory)
     if (client) {
+      try {
+        const answers = ctx.questions.map((_, i) => {
+          return ctx.answers[i] || ['_cancelled_']
+        })
+        await client.question.reply({
+          requestID: ctx.requestId,
+          directory: ctx.directory,
+          answers,
+        })
+        logger.log(`Expired question ${ctx.requestId} for session ${ctx.sessionId}`)
+      } catch (error) {
+        logger.error('Failed to reply to expired question:', error)
+      }
       await client.session.abort({
         sessionID: ctx.sessionId,
       }).catch((error) => {
@@ -411,11 +423,28 @@ export async function cancelPendingQuestion(
     return 'no-pending'
   }
 
-  // undefined means teardown/cleanup — just remove context, don't reply.
+  // undefined means teardown/cleanup — remove context and reply to OpenCode
+  // with an abort answer so the question tool doesn't stay stuck in 'running'.
   // The session is already being torn down or the caller wants to dismiss
   // the question without providing an answer (e.g. voice/attachment-only
   // messages where content needs transcription before it can be an answer).
   if (userMessage === undefined) {
+    try {
+      const client = getOpencodeClient(context.directory)
+      if (client) {
+        const answers = context.questions.map((_, i) => {
+          return context.answers[i] || ['_cancelled_']
+        })
+        await client.question.reply({
+          requestID: context.requestId,
+          directory: context.directory,
+          answers,
+        })
+        logger.log(`Cancelled question ${context.requestId} for thread ${threadId}`)
+      }
+    } catch (error) {
+      logger.error('Failed to cancel question reply:', error)
+    }
     deletePendingQuestionContextsForRequest({
       threadId: context.thread.id,
       requestId: context.requestId,
