@@ -877,14 +877,6 @@ export function createDeterministicMatchers(): DeterministicMatcher[] {
     permissionTypingFollowupMatcher,
     channelReferencePermissionMatcher,
     channelReferencePermissionFollowupMatcher,
-<<<<<<< HEAD
-
-=======
-    subagentPermissionTaskMatcher,
-    subagentPermissionChildMatcher,
-    subagentPermissionChildFollowupMatcher,
-    subagentPermissionParentFollowupMatcher,
->>>>>>> 2fd7509 (fix: auto-reject subagent permission prompts)
     multiToolMatcher,
     multiToolFollowupMatcher,
     undoFileMatcher,
