@@ -237,7 +237,7 @@ export async function showPermissionButtons({
   return { messageId: permissionMessage.id, contextHash }
 }
 
-export function updatePermissionMessage({
+function updatePermissionMessage({
   context,
   status,
 }: {

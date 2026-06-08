@@ -337,119 +337,6 @@ export function createDeterministicMatchers(): DeterministicMatcher[] {
   }
 
 
-  const subagentPermissionTaskMatcher: DeterministicMatcher = {
-    id: 'subagent-permission-auto-reject-task',
-    priority: 112,
-    when: {
-      lastMessageRole: 'user',
-      latestUserTextIncludes: 'SUBAGENT_PERMISSION_AUTO_REJECT_MARKER',
-    },
-    then: {
-      parts: [
-        { type: 'stream-start', warnings: [] },
-        {
-          type: 'tool-call',
-          toolCallId: 'subagent-permission-task-call',
-          toolName: 'task',
-          input: JSON.stringify({
-            description: 'probe subagent permission rejection',
-            subagent_type: 'general',
-            prompt:
-              'SUBAGENT_PERMISSION_CHILD_MARKER. Read /Users/morse/.zprofile with the read tool, then reply exactly: child-permission-finished.',
-          }),
-        },
-        {
-          type: 'finish',
-          finishReason: 'tool-calls',
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        },
-      ],
-    },
-  }
-
-  const subagentPermissionChildMatcher: DeterministicMatcher = {
-    id: 'subagent-permission-auto-reject-child',
-    priority: 112,
-    when: {
-      lastMessageRole: 'user',
-      latestUserTextIncludes: 'SUBAGENT_PERMISSION_CHILD_MARKER',
-    },
-    then: {
-      parts: [
-        { type: 'stream-start', warnings: [] },
-        { type: 'text-start', id: 'subagent-permission-child-start' },
-        {
-          type: 'text-delta',
-          id: 'subagent-permission-child-start',
-          delta: 'subagent requesting external read permission',
-        },
-        { type: 'text-end', id: 'subagent-permission-child-start' },
-        {
-          type: 'tool-call',
-          toolCallId: 'subagent-permission-read-call',
-          toolName: 'read',
-          input: JSON.stringify({ filePath: '/Users/morse/.zprofile' }),
-        },
-        {
-          type: 'finish',
-          finishReason: 'tool-calls',
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        },
-      ],
-    },
-  }
-
-  const subagentPermissionChildFollowupMatcher: DeterministicMatcher = {
-    id: 'subagent-permission-auto-reject-child-followup',
-    priority: 112,
-    when: {
-      lastMessageRole: 'tool',
-      latestUserTextIncludes: 'SUBAGENT_PERMISSION_CHILD_MARKER',
-    },
-    then: {
-      parts: [
-        { type: 'stream-start', warnings: [] },
-        { type: 'text-start', id: 'subagent-permission-child-followup' },
-        {
-          type: 'text-delta',
-          id: 'subagent-permission-child-followup',
-          delta: 'child-permission-finished',
-        },
-        { type: 'text-end', id: 'subagent-permission-child-followup' },
-        {
-          type: 'finish',
-          finishReason: 'stop',
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        },
-      ],
-    },
-  }
-
-  const subagentPermissionParentFollowupMatcher: DeterministicMatcher = {
-    id: 'subagent-permission-auto-reject-parent-followup',
-    priority: 112,
-    when: {
-      lastMessageRole: 'tool',
-      latestUserTextIncludes: 'SUBAGENT_PERMISSION_AUTO_REJECT_MARKER',
-    },
-    then: {
-      parts: [
-        { type: 'stream-start', warnings: [] },
-        { type: 'text-start', id: 'subagent-permission-parent-followup' },
-        {
-          type: 'text-delta',
-          id: 'subagent-permission-parent-followup',
-          delta: 'subagent-permission-auto-reject-done',
-        },
-        { type: 'text-end', id: 'subagent-permission-parent-followup' },
-        {
-          type: 'finish',
-          finishReason: 'stop',
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        },
-      ],
-    },
-  }
 
   const actionButtonClickFollowupMatcher: DeterministicMatcher = {
     id: 'action-button-click-followup',
@@ -877,6 +764,10 @@ export function createDeterministicMatchers(): DeterministicMatcher[] {
     permissionTypingFollowupMatcher,
     channelReferencePermissionMatcher,
     channelReferencePermissionFollowupMatcher,
+<<<<<<< HEAD
+=======
+
+>>>>>>> f0742da (revert: remove broken subagent permission auto-reject code)
     multiToolMatcher,
     multiToolFollowupMatcher,
     undoFileMatcher,
@@ -906,10 +797,6 @@ export const TEST_USER_ID = '200000000000000991'
  * Sets up a full queue-advanced e2e environment: digital-twin Discord server,
  * opencode deterministic provider, database, bot client.
  * Each caller should use a unique channelId and dirName to avoid collisions
- * when vitest runs files in parallel.
- */
-export function setupQueueAdvancedSuite({
-  channelId,
   channelName,
   extraChannels = [],
   dirName,
