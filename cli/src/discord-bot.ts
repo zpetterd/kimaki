@@ -2,6 +2,7 @@
 // Bridges Discord messages to OpenCode sessions, manages voice connections,
 // and orchestrates the main event loop for the Kimaki bot.
 
+import { DiscordOperationError } from './errors.js'
 import {
   initDatabase,
   closeDatabase,
@@ -124,7 +125,7 @@ import {
 } from 'discord.js'
 import fs from 'node:fs'
 import path from 'node:path'
-import * as errore from 'errore'
+
 import dedent from 'string-dedent'
 import { createLogger, formatErrorWithStack, LogPrefix } from './logger.js'
 import { writeHeapSnapshot, startHeapMonitor } from './heap-monitor.js'
@@ -486,10 +487,8 @@ export async function startDiscordBot({
 
       if (message.partial) {
         discordLogger.log(`Fetching partial message ${message.id}`)
-        const fetched = await errore.tryAsync({
-          try: () => message.fetch(),
-          catch: (e) => e,
-        })
+        const fetched = await message.fetch()
+          .catch((e) => new DiscordOperationError({ operation: 'fetchMessage', cause: e }))
         if (fetched instanceof Error) {
           discordLogger.log(
             `Failed to fetch partial message ${message.id}:`,
@@ -775,7 +774,7 @@ export async function startDiscordBot({
 
         // Notify when a voice message was queued instead of sent immediately
         if (enqueueResult.queued && enqueueResult.position) {
-          await sendThreadMessage(thread, `Queued at position ${enqueueResult.position}`)
+          await sendThreadMessage(thread, `Queued at position ${enqueueResult.position}. Edit your message to update it in queue`)
         }
       }
 
@@ -928,11 +927,20 @@ export async function startDiscordBot({
           })
         }
 
+        const sessionDirectory = await (async () => {
+          if (!worktreePromise) {
+            return projectDirectory
+          }
+          const result = await worktreePromise
+          if (result instanceof Error) return projectDirectory
+          return result
+        })()
+
         const channelRuntime = getOrCreateRuntime({
           threadId: thread.id,
           thread,
           projectDirectory,
-          sdkDirectory: projectDirectory,
+          sdkDirectory: sessionDirectory,
           channelId: channel.id,
           appId: currentAppId,
         })
@@ -945,19 +953,6 @@ export async function startDiscordBot({
           sourceThreadId: thread.id,
           appId: currentAppId,
           preprocess: async () => {
-            // Wait for worktree creation + install before preprocessing.
-            // Follow-up messages queue behind this in the preprocess chain.
-            let sessionDirectory = projectDirectory
-            if (worktreePromise) {
-              const result = await worktreePromise
-              if (!(result instanceof Error)) {
-                sessionDirectory = result
-                channelRuntime.handleDirectoryChanged({
-                  oldDirectory: projectDirectory,
-                  newDirectory: sessionDirectory,
-                })
-              }
-            }
             return preprocessNewThreadMessage({
               message,
               thread,
@@ -1030,10 +1025,26 @@ export async function startDiscordBot({
         forceQueue ? prompt : '',
       )
 
-      if (result.found) {
-        discordLogger.log(
-          `[MESSAGE_EDIT] ${result.removed ? 'Removed' : 'Updated'} queued message ${message.id} in thread ${channel.id}`,
-        )
+      if (result.found && channel.isThread()) {
+        const displayName =
+          message.member?.displayName ?? message.author.displayName
+        if (result.removed) {
+          discordLogger.log(
+            `[MESSAGE_EDIT] Removed queued message ${message.id} in thread ${channel.id}`,
+          )
+          await sendThreadMessage(
+            channel,
+            `⬦ **${displayName}** removed message from queue`,
+          )
+        } else {
+          discordLogger.log(
+            `[MESSAGE_EDIT] Updated queued message ${message.id} in thread ${channel.id}`,
+          )
+          await sendThreadMessage(
+            channel,
+            `⬦ **${displayName}** edited queued message`,
+          )
+        }
       }
     } catch (error) {
       discordLogger.error(
@@ -1217,11 +1228,23 @@ export async function startDiscordBot({
 
       const botThreadStartSource = parseSessionStartSourceFromMarker(marker)
 
+      const sessionDirectory = await (async () => {
+        if (cwdDirectory) {
+          return cwdDirectory
+        }
+        if (!worktreePromise) {
+          return projectDirectory
+        }
+        const result = await worktreePromise
+        if (result instanceof Error) return projectDirectory
+        return result
+      })()
+
       const runtime = getOrCreateRuntime({
         threadId: thread.id,
         thread,
         projectDirectory,
-        sdkDirectory: projectDirectory,
+        sdkDirectory: sessionDirectory,
         channelId: parent.id,
         appId: currentAppId,
       })
@@ -1242,23 +1265,6 @@ export async function startDiscordBot({
             }
           : undefined,
         preprocess: async () => {
-          // Wait for worktree creation + install before starting session.
-          if (worktreePromise) {
-            const result = await worktreePromise
-            if (!(result instanceof Error)) {
-              runtime.handleDirectoryChanged({
-                oldDirectory: projectDirectory,
-                newDirectory: result,
-              })
-            }
-          }
-          // --cwd: switch sdkDirectory to the existing worktree path
-          if (cwdDirectory) {
-            runtime.handleDirectoryChanged({
-              oldDirectory: projectDirectory,
-              newDirectory: cwdDirectory,
-            })
-          }
           const permissionRules = await getChannelReferencePermissionRules({
             message: starterMessage,
           })
@@ -1324,6 +1330,21 @@ export async function startDiscordBot({
   const stopTaskRunner = startTaskRunner({ token })
   const stopRuntimeIdleSweeper = startRuntimeIdleSweeper()
   const stopThreadCleanupSweeper = startThreadCleanupSweeper({ discordClient })
+
+  // Prevent discord.js from permanently killing the REST token on 401.
+  // @discordjs/rest calls setToken(null) whenever it receives a 401 response.
+  // The gateway proxy now returns 503 for stale-DB rejections (not 401), but
+  // this guard stays as defense-in-depth for any other transient 401 source.
+  // Allows null through when Client.destroy() is running (it sets client.token
+  // = null before calling rest.setToken(null)).
+  const originalSetToken = discordClient.rest.setToken.bind(discordClient.rest)
+  discordClient.rest.setToken = (newToken) => {
+    if (!newToken && discordClient.token !== null) {
+      discordLogger.warn('[REST] Blocked token nullification from 401 response')
+      return discordClient.rest
+    }
+    return originalSetToken(newToken)
+  }
 
   const handleShutdown = async (signal: string, { skipExit = false } = {}) => {
     discordLogger.log(`Received ${signal}, cleaning up...`)
