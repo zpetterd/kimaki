@@ -84,6 +84,7 @@ import { markDiscordGatewayReady, stopHranaServer } from './hrana-server.js'
 import { notifyError } from './sentry.js'
 import { flushDebouncedProcessCallbacks } from './debounced-process-flush.js'
 import { startRuntimeIdleSweeper } from './runtime-idle-sweeper.js'
+import { startThreadCleanupSweeper } from './thread-cleanup-sweeper.js'
 import { store } from './store.js'
 import {
   startExternalOpencodeSessionSync,
@@ -1322,6 +1323,7 @@ export async function startDiscordBot({
   startHeapMonitor()
   const stopTaskRunner = startTaskRunner({ token })
   const stopRuntimeIdleSweeper = startRuntimeIdleSweeper()
+  const stopThreadCleanupSweeper = startThreadCleanupSweeper({ discordClient })
 
   const handleShutdown = async (signal: string, { skipExit = false } = {}) => {
     discordLogger.log(`Received ${signal}, cleaning up...`)
@@ -1334,6 +1336,7 @@ export async function startDiscordBot({
 
     try {
       await stopRuntimeIdleSweeper()
+      await stopThreadCleanupSweeper()
       await stopTaskRunner()
 
       await flushDebouncedProcessCallbacks().catch((error) => {
