@@ -471,8 +471,6 @@ cli
             `Prompt sent to thread: ${threadData.name}\n${sessionLine}\nURL: ${threadUrl}`,
             '✅ Message Sent',
           )
-          if (existingSessionId) process.stdout.write(`Session: ${existingSessionId}\n`)
-          process.stdout.write(`${threadUrl}\n`)
 
           if (options.wait) {
             const { waitAndOutputSession } = await import('../wait-session.js')
@@ -667,18 +665,15 @@ cli
           newSessionId = await waitForSessionId({
             threadId: threadData.id,
             timeoutMs: 15_000,
+<<<<<<< HEAD
           }).catch((e) => {
             cliLogger.warn(`Could not resolve session ID: ${e instanceof Error ? e.message : String(e)}`)
             return undefined
           })
-        }
-
-        const worktreeNote = worktreeName
-          ? `\nWorktree: ${worktreeName} (will be created by bot)`
-          : resolvedCwd
-            ? `\nWorking directory: ${resolvedCwd}`
-            : ''
+=======
+          }).catch(() => undefined)
         const sessionLine = newSessionId ? `\nSession: ${newSessionId}` : ''
+<<<<<<< HEAD
         const directoryLine = projectDirectory ? `\nDirectory: ${projectDirectory}` : ''
         const successMessage = notifyOnly
           ? `Thread: ${threadData.name}${directoryLine}\n\nNotification created. Reply to start a session.\n\nURL: ${threadUrl}`
@@ -688,21 +683,11 @@ cli
 
         if (newSessionId) process.stdout.write(`Session: ${newSessionId}\n`)
         process.stdout.write(`${threadUrl}\n`)
+=======
+        const successMessage = notifyOnly
+          ? `Thread: ${threadData.name}\nDirectory: ${projectDirectory}\n\nNotification created. Reply to start a session.\n\nURL: ${threadUrl}`
+          : `Thread: ${threadData.name}\nDirectory: ${projectDirectory}${worktreeNote}${sessionLine}\n\nThe running bot will pick this up and start the session.\n\nURL: ${threadUrl}`
 
-        if (options.wait) {
-          // projectDirectory is guaranteed here: --wait is incompatible with --notify-only,
-          // and non-notify sends already require channelConfig above.
-          const { waitAndOutputSession } = await import('../wait-session.js')
-          await waitAndOutputSession({
-            threadId: threadData.id,
-            projectDirectory: projectDirectory!,
-            waitStartedAtMs,
-          })
-        }
-
-        process.exit(0)
-      } catch (error) {
-        cliLogger.error(
           'Error:',
           error instanceof Error ? error.stack : String(error),
         )
