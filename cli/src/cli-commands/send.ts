@@ -680,9 +680,10 @@ cli
             ? `\nWorking directory: ${resolvedCwd}`
             : ''
         const sessionLine = newSessionId ? `\nSession: ${newSessionId}` : ''
+        const directoryLine = projectDirectory ? `\nDirectory: ${projectDirectory}` : ''
         const successMessage = notifyOnly
-          ? `Thread: ${threadData.name}\nDirectory: ${projectDirectory}\n\nNotification created. Reply to start a session.\n\nURL: ${threadUrl}`
-          : `Thread: ${threadData.name}\nDirectory: ${projectDirectory}${worktreeNote}${sessionLine}\n\nThe running bot will pick this up and start the session.\n\nURL: ${threadUrl}`
+          ? `Thread: ${threadData.name}${directoryLine}\n\nNotification created. Reply to start a session.\n\nURL: ${threadUrl}`
+          : `Thread: ${threadData.name}${directoryLine}${worktreeNote}${sessionLine}\n\nThe running bot will pick this up and start the session.\n\nURL: ${threadUrl}`
 
         note(successMessage, '✅ Thread Created')
 
@@ -690,10 +691,12 @@ cli
         process.stdout.write(`${threadUrl}\n`)
 
         if (options.wait) {
+          // projectDirectory is guaranteed here: --wait is incompatible with --notify-only,
+          // and non-notify sends already require channelConfig above.
           const { waitAndOutputSession } = await import('../wait-session.js')
           await waitAndOutputSession({
             threadId: threadData.id,
-            projectDirectory,
+            projectDirectory: projectDirectory!,
             waitStartedAtMs,
           })
         }
