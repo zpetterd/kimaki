@@ -149,7 +149,6 @@ export async function showPermissionButtons({
     contextHash,
   }
 
-  const ttlMs = getTtlMs()
   pendingPermissionContexts.set(contextHash, context)
   // Auto-reject on TTL expiry so the OpenCode session doesn't hang forever
   // waiting for a permission reply that will never come. Uses atomic take

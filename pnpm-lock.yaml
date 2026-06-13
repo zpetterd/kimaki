@@ -419,11 +419,11 @@ importers:
   opencode-injection-guard:
     devDependencies:
       '@opencode-ai/plugin':
-        specifier: ^1.4.6
-        version: 1.15.11
+        specifier: ^1.15.11
+        version: 1.16.2
       '@opencode-ai/sdk':
-        specifier: ^1.4.6
-        version: 1.15.11
+        specifier: ^1.15.11
+        version: 1.16.2
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.7
@@ -1874,20 +1874,6 @@ packages:
   '@noble/hashes@2.0.1':
     resolution: {integrity: sha512-XlOlEbQcE9fmuXxrVTXCTlG2nlRXa9Rj3rr5Ue/+tX+nmkgbX720YHh0VR3hBF9xDvwnb8D2shVGOwNx+ulArw==}
     engines: {node: '>= 20.19.0'}
-
-  '@opencode-ai/plugin@1.15.11':
-    resolution: {integrity: sha512-RDvYDCHO0+3OAGD590oDQqtryrENrUW04SjtoA4sgRV2efpZeBFjx3TnonBsXKq6nWqYg172nhltUEZsihGnXQ==}
-    peerDependencies:
-      '@opentui/core': '>=0.2.15'
-      '@opentui/keymap': '>=0.2.15'
-      '@opentui/solid': '>=0.2.15'
-    peerDependenciesMeta:
-      '@opentui/core':
-        optional: true
-      '@opentui/keymap':
-        optional: true
-      '@opentui/solid':
-        optional: true
 
   '@opencode-ai/plugin@1.16.2':
     resolution: {integrity: sha512-FaZhVXrbz93xsdGLCtarRDTeqFt8AkLfh8B34tFBj6G4HXVmKSgBwVXmtELKKC+08xMtawBC9hshiMbXryv6cg==}
@@ -3843,9 +3829,6 @@ packages:
   effect@3.19.18:
     resolution: {integrity: sha512-KlbNuYzzwpOpnpshIhjCaqweQkthAT1oVG61Z2wIHqo6Sb6n/+pgzFXyTvsLyxcx5Cg3aWaQXa0XQHMuzdVW4A==}
 
-  effect@4.0.0-beta.66:
-    resolution: {integrity: sha512-4arEr62cziFa8BBVDUwJCJJmaVepXf/kRg7KtC0h8+bufngscrHbwWFhr9c+HonwOF+31U3iD3xUJmw9KzX7Dw==}
-
   effect@4.0.0-beta.74:
     resolution: {integrity: sha512-Yx+Kh12U+i2FmjwEfKs+ePFmpMd43RPD1oGqc/VraSS9bYzvF0Ff3PojwEFEVEewp8xc92Uxu28gTspU4qyvHA==}
 
@@ -4328,10 +4311,6 @@ packages:
 
   ini@1.3.8:
     resolution: {integrity: sha512-JV/yugV2uzW5iMRSiZAyDtQd+nxtUnjeLt0acNdw98kKLrvuRVyB80tsREOE7yvGVgalhZ6RNXCmEHkUKBKxew==}
-
-  ini@6.0.0:
-    resolution: {integrity: sha512-IBTdIkzZNOpqm7q3dRqJvMaldXjDHWkEDfrwGEQTs5eaQMWV+djAhR+wahyNNMAa+qpbDUhBMVt4ZKNwpPm7xQ==}
-    engines: {node: ^20.17.0 || >=22.9.0}
 
   ini@7.0.0:
     resolution: {integrity: sha512-ifK0CgjALofS5bkrcTy4RaQ9Vx2Knf/eLeIO+NaswQEpH1UblrtTSCIvN71qQDMq0PeQ/SSPojvEJp9vvvfr+w==}
@@ -4990,9 +4969,6 @@ packages:
   msgpackr-extract@3.0.4:
     resolution: {integrity: sha512-4kmO/MdyUIkLIvTPr8VHLil4AtoKIoniWPIEk5+CDy0xnWC84azhSFmuJ7PxZdsYtiP5kEeQsORAVIeMgxT+Hw==}
     hasBin: true
-
-  msgpackr@1.11.12:
-    resolution: {integrity: sha512-RBdJ1Un7yGlXWajrkxcSa93nvQ0w4zBf60c0yYv7YtBelP8H2FA7XsfBbMHtXKXUMUxH7zV3Zuozh+kUQWhHvg==}
 
   msgpackr@2.0.2:
     resolution: {integrity: sha512-c5hYOXFbP79Slh6Dzd2wzk+jnV7mX1UxfMYtilnY1NmalXPqG8DGb5cYCMBrW4AsH3zekBBZd4QrKz9NhtvYLQ==}
@@ -5988,10 +5964,6 @@ packages:
   utils-merge@1.0.1:
     resolution: {integrity: sha512-pMZTvIkT1d+TFGvDOqodOclx0QWkkgi6Tdoa8gC8ffGAAqz9pzPTZWAybbsHHoED/ztMtkv/VoYTYyShUn81hA==}
     engines: {node: '>= 0.4.0'}
-
-  uuid@13.0.2:
-    resolution: {integrity: sha512-vzi9uRZ926x4XV73S/4qQaTwPXM2JBj6/6lI/byHH1jOpCzb0zDbfytgA9LcN/hzb2l7WQSQnxITOVx5un/wGw==}
-    hasBin: true
 
   uuid@14.0.0:
     resolution: {integrity: sha512-Qo+uWgilfSmAhXCMav1uYFynlQO7fMFiMVZsQqZRMIXp0O7rR7qjkj+cPvBHLgBqi960QCoo/PH2/6ZtVqKvrg==}
@@ -7561,12 +7533,6 @@ snapshots:
   '@noble/ciphers@2.1.1': {}
 
   '@noble/hashes@2.0.1': {}
-
-  '@opencode-ai/plugin@1.15.11':
-    dependencies:
-      '@opencode-ai/sdk': 1.15.11
-      effect: 4.0.0-beta.66
-      zod: 4.1.8
 
   '@opencode-ai/plugin@1.16.2':
     dependencies:
@@ -9361,19 +9327,6 @@ snapshots:
       '@standard-schema/spec': 1.1.0
       fast-check: 3.23.2
 
-  effect@4.0.0-beta.66:
-    dependencies:
-      '@standard-schema/spec': 1.1.0
-      fast-check: 4.8.0
-      find-my-way-ts: 0.1.6
-      ini: 6.0.0
-      kubernetes-types: 1.30.0
-      msgpackr: 1.11.12
-      multipasta: 0.2.7
-      toml: 4.1.1
-      uuid: 13.0.2
-      yaml: 2.9.0
-
   effect@4.0.0-beta.74:
     dependencies:
       '@standard-schema/spec': 1.1.0
@@ -10016,8 +9969,6 @@ snapshots:
 
   ini@1.3.8:
     optional: true
-
-  ini@6.0.0: {}
 
   ini@7.0.0: {}
 
@@ -10892,10 +10843,6 @@ snapshots:
       '@msgpackr-extract/msgpackr-extract-linux-x64': 3.0.4
       '@msgpackr-extract/msgpackr-extract-win32-x64': 3.0.4
     optional: true
-
-  msgpackr@1.11.12:
-    optionalDependencies:
-      msgpackr-extract: 3.0.4
 
   msgpackr@2.0.2:
     optionalDependencies:
@@ -12049,8 +11996,6 @@ snapshots:
   util-deprecate@1.0.2: {}
 
   utils-merge@1.0.1: {}
-
-  uuid@13.0.2: {}
 
   uuid@14.0.0: {}
 
