@@ -1,6 +1,11 @@
 // Permission button handler - Shows buttons for permission requests.
 // When OpenCode asks for permission, this module renders 3 buttons:
 // Accept, Accept Always, and Deny.
+//
+// The `directory` stored in PendingPermissionContext is the session directory
+// (sdkDirectory), which equals the worktree path for worktree threads.
+// This is used for both getOpencodeClient() (so the client header matches)
+// and for explicit `directory` params in SDK calls.
 
 import {
   ButtonBuilder,
@@ -97,7 +102,6 @@ type PendingPermissionContext = {
   permission: PermissionRequest
   requestIds: string[]
   directory: string
-  permissionDirectory: string
   thread: ThreadChannel
   contextHash: string
   messageId?: string
@@ -128,13 +132,11 @@ export async function showPermissionButtons({
   thread,
   permission,
   directory,
-  permissionDirectory,
   subtaskLabel,
 }: {
   thread: ThreadChannel
   permission: PermissionRequest
   directory: string
-  permissionDirectory: string
   subtaskLabel?: string
 }): Promise<{ messageId: string; contextHash: string }> {
   const contextHash = crypto.randomBytes(8).toString('hex')
@@ -143,19 +145,17 @@ export async function showPermissionButtons({
     permission,
     requestIds: [permission.id],
     directory,
-    permissionDirectory,
     thread,
     contextHash,
   }
 
-  const ttlMs = getTtlMs()
   pendingPermissionContexts.set(contextHash, context)
   // Auto-reject on TTL expiry so the OpenCode session doesn't hang forever
   // waiting for a permission reply that will never come. Uses atomic take
   // so only one of TTL-expiry or button-click can win.
   // With continue_loop_on_deny enabled in opencode config, the model sees
   // this as a tool error and continues (tries alternatives or explains).
-  const ttlMs = getPermissionTimeoutMs()
+  const permissionTimeoutMs = getPermissionTimeoutMs()
   setTimeout(async () => {
     const ctx = takePendingPermissionContext(contextHash)
     if (!ctx) {
@@ -173,7 +173,7 @@ export async function showPermissionButtons({
         requestIds.map((requestId) => {
           return client.permission.reply({
             requestID: requestId,
-            directory: ctx.permissionDirectory,
+            directory: ctx.directory,
             reply: 'reject',
             message: timeoutFeedback,
           })
@@ -181,13 +181,13 @@ export async function showPermissionButtons({
       ).catch((error) => {
         logger.error('Failed to auto-reject expired permission:', error)
       })
-      const minutes = Math.round(ttlMs / 60_000)
+      const minutes = Math.round(permissionTimeoutMs / 60_000)
       updatePermissionMessage({
         context: ctx,
         status: `_Permission expired after ${minutes} minute${minutes !== 1 ? 's' : ''} and was rejected._`,
       })
     }
-  }, ttlMs).unref()
+  }, permissionTimeoutMs).unref()
 
   const patternStr = compactPermissionPatterns(permission.patterns).join(', ')
 
@@ -302,7 +302,7 @@ export async function cancelPendingPermission(threadId: string): Promise<boolean
       requestIds.map((requestId) => {
         return client.permission.reply({
           requestID: requestId,
-          directory: pendingContext.permissionDirectory,
+          directory: pendingContext.directory,
           reply: 'reject',
         })
       }),
@@ -374,7 +374,7 @@ export async function handlePermissionButton(interaction: ButtonInteraction): Pr
       requestIds.map((requestId) => {
         return permClient.permission.reply({
           requestID: requestId,
-          directory: context.permissionDirectory,
+          directory: context.directory,
           reply: response,
         })
       }),
@@ -384,7 +384,7 @@ export async function handlePermissionButton(interaction: ButtonInteraction): Pr
       const resumed = await resumeSessionIfIdleAfterPermission({
         client: permClient,
         sessionId: context.permission.sessionID,
-        directory: context.permissionDirectory,
+        directory: context.directory,
       })
       if (resumed instanceof Error) {
         logger.error('Failed to resume idle session after permission:', resumed)
