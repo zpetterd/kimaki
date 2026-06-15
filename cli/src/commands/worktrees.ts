@@ -214,9 +214,7 @@ function buildWorktreeTable({
       return parts.join(', ')
     })()
     const created = row.createdAt ? formatTimeAgo(row.createdAt) : '-'
-    // Show only the last 2 path segments to keep text size under Discord's
-    // 4000-char displayable text limit. Full paths are too long.
-    const folder = `…/${path.basename(path.dirname(row.directory))}/${path.basename(row.directory)}`
+    const folder = row.directory
     const action = buildActionCell({ row, gitStatus: gs })
     return `| ${sourceCell} | ${name} | ${status} | ${created} | ${folder} | ${action} |`
   })
@@ -528,17 +526,13 @@ async function renderWorktreesReply({
     return [textDisplay]
   })
 
-  // Reserve budget for a truncation notice (1 component + its text length)
-  // so appending the notice doesn't push us over either Discord limit.
-  const truncatedNoticeContent = `*Some worktrees were not shown due to Discord's component limit. Use \`git worktree list\` for the full list.*`
-  const { components, truncated } = truncateComponents(allComponents, {
-    reserveCost: 1,
-    reserveTextSize: truncatedNoticeContent.length,
-  })
+  // Reserve 1 component for a truncation notice so the notice itself
+  // doesn't push us over the 40-component limit.
+  const { components, truncated } = truncateComponents(allComponents, { reserveCost: 1 })
   if (truncated) {
     const truncatedNotice: APITextDisplayComponent = {
       type: ComponentType.TextDisplay,
-      content: truncatedNoticeContent,
+      content: `*Some worktrees were not shown due to Discord's component limit. Use \`git worktree list\` for the full list.*`,
     }
     components.push(truncatedNotice)
   }
