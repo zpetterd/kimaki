@@ -109,7 +109,7 @@ function hasPendingCleanupAction(threadId: string): boolean {
   return false
 }
 
-async function evaluateThreadForCleanup({
+export async function evaluateThreadForCleanup({
   threadId,
   rest,
 }: {
