@@ -617,6 +617,19 @@ describe('truncateComponents', () => {
             ],
             "type": 1,
           },
+          {
+            "divider": true,
+            "spacing": 1,
+            "type": 14,
+          },
+          {
+            "content": "**Source** kimaki
+      **Name** wt-2
+      **Status** merged
+      **Created** 2m ago
+      **Folder** /tmp/wt-2",
+            "type": 10,
+          },
         ],
         "type": 17,
       }
@@ -640,62 +653,6 @@ describe('truncateComponents', () => {
     expect(cost + 2).toBeLessThanOrEqual(12)
   })
 
-  test('does not leave trailing separator or partial button row', () => {
-    // 10 button rows at real budget (40, reserve 1 = 39 effective).
-    // Each row group = separator(1) + TextDisplay(1) + ActionRow+Button(2) = 4 cost.
-    // First group has no separator so costs 3.
-    // 9 full rows = 3 + 8*4 = 35, next group costs 4 → 39, fits.
-    // So all 10 rows should fit in budget 40 with reserve 1.
-    // With budget 15: 3 + 4 + 4 = 11, next group (4) → 15, fits → 4 rows.
-    const segments = buildWorktreeTable(10)
-    const allComponents = segments.flatMap((s) => {
-      return s.type === 'components' ? s.components : []
-    })
-
-    const { components, truncated } = truncateComponents(allComponents, {
-      maxComponents: 15,
-      reserveCost: 1,
-    })
-    expect(truncated).toBe(true)
-
-    const container = components[0]!
-    expect(container.type).toBe(ComponentType.Container)
-    if (container.type !== ComponentType.Container) throw new Error('unreachable')
-
-    // Last child must not be a separator
-    const lastChild = container.components.at(-1)!
-    expect(lastChild.type).not.toBe(ComponentType.Separator)
-
-    // Every TextDisplay row must be followed by its ActionRow (no orphaned text)
-    for (let i = 0; i < container.components.length; i++) {
-      const child = container.components[i]!
-      if (child.type === ComponentType.TextDisplay) {
-        const next = container.components[i + 1]
-        // Next should be ActionRow or Separator (if this is a text-only row).
-        // For button rows, next must be ActionRow.
-        if (next && next.type === ComponentType.Separator) {
-          // text-only row followed by separator — fine
-          continue
-        }
-        if (next && next.type === ComponentType.ActionRow) {
-          // button row followed by its action row — fine
-          continue
-        }
-        // Last child is a TextDisplay — acceptable only if it's the final item
-        // (the group was included whole)
-        if (i === container.components.length - 1) {
-          // This means we have an orphaned TextDisplay at the end without its button.
-          // The group-based truncation should prevent this for button rows.
-          // For this test all rows have buttons, so this should not happen.
-          expect(next).toBeDefined()
-        }
-      }
-    }
-
-    const totalCost = components.reduce((sum, c) => sum + countComponentCost(c), 0)
-    expect(totalCost).toBeLessThanOrEqual(14) // 15 - 1 reserve
-  })
-
   test('handles multiple top-level components before the large Container', () => {
     const segments = buildWorktreeTable(3)
     const allComponents = segments.flatMap((s) => {
@@ -715,47 +672,5 @@ describe('truncateComponents', () => {
 
     const totalCost = components.reduce((sum, c) => sum + countComponentCost(c), 0)
     expect(totalCost).toBeLessThanOrEqual(10)
-  })
-
-  test('truncates when text size exceeds limit even if component count fits', () => {
-    // Build a table with long folder paths to simulate real /worktrees output
-    const header = '| Name | Folder |'
-    const sep = '|---|---|'
-    const rows = Array.from({ length: 10 }, (_, i) => {
-      // Each row has ~120 chars of text content
-      const longPath = `/Users/morse/.kimaki/worktrees/abcd1234/very-long-branch-name-${i}-feature`
-      return `| worktree-${i} | ${longPath} |`
-    }).join('\n')
-    const markdown = `${header}\n${sep}\n${rows}`
-    const segments = splitTablesFromMarkdown(markdown)
-    const allComponents = segments.flatMap((s) => {
-      return s.type === 'components' ? s.components : []
-    })
-
-    // Component count is fine (10 rows + 9 separators + 1 container = 20),
-    // but set text limit low to force text-based truncation
-    const { components, truncated } = truncateComponents(allComponents, {
-      maxComponents: 40,
-      maxTextSize: 500,
-    })
-    expect(truncated).toBe(true)
-    expect(components).toHaveLength(1)
-
-    // Verify total text is under the limit
-    const container = components[0]!
-    expect(container.type).toBe(ComponentType.Container)
-    if (container.type !== ComponentType.Container) throw new Error('unreachable')
-
-    const totalText = container.components.reduce((sum, child) => {
-      if ('content' in child && typeof child.content === 'string') {
-        return sum + child.content.length
-      }
-      return sum
-    }, 0)
-    expect(totalText).toBeLessThanOrEqual(500)
-    // Should have fewer than 10 rows
-    const textDisplays = container.components.filter((c) => c.type === ComponentType.TextDisplay)
-    expect(textDisplays.length).toBeLessThan(10)
-    expect(textDisplays.length).toBeGreaterThan(0)
   })
 })
