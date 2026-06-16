@@ -1,7 +1,7 @@
 // Manual archive command - /archive-thread
-// Triggers the cleanup evaluation for the current thread immediately.
+// Immediately archives the current thread without confirmation.
 
-import { ChannelType, MessageFlags } from 'discord.js'
+import { ChannelType, MessageFlags, Routes } from 'discord.js'
 import type { CommandContext } from './types.js'
 import { createLogger, formatErrorWithStack } from '../logger.js'
 
@@ -20,18 +20,16 @@ export async function handleArchiveThreadCommand({ command }: CommandContext): P
 
   await command.deferReply({ flags: MessageFlags.Ephemeral })
 
-  // Lazy-import to avoid circular dependency at module load time
-  const { evaluateThreadForCleanup: evaluateForCleanup } =
-    await import('../thread-cleanup-sweeper.js')
-
   const rest = command.client.rest
 
   try {
-    await evaluateForCleanup({ threadId: channel.id, rest })
-    await command.editReply({ content: 'Cleanup evaluation done.' })
+    await rest.patch(Routes.channel(channel.id), {
+      body: { archived: true },
+    })
+    await command.editReply({ content: 'Thread archived.' })
   } catch (error) {
-    logger.error(`Error evaluating thread ${channel.id}:`, formatErrorWithStack(error))
-    await command.editReply({ content: 'Cleanup evaluation failed.' })
+    logger.error(`Error archiving thread ${channel.id}:`, formatErrorWithStack(error))
+    await command.editReply({ content: 'Failed to archive thread.' })
   }
 }
 
@@ -43,6 +41,6 @@ const threadTypes = [
 
 export const archiveThreadSlashCommand = {
   name: 'archive-thread',
-  description: 'Manually trigger the cleanup evaluation for this thread',
+  description: 'Immediately archive this thread without confirmation',
   allowedChannelTypes: threadTypes,
 }
