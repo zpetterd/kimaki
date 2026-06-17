@@ -793,6 +793,7 @@ export const TEST_USER_ID = '200000000000000991'
  * Sets up a full queue-advanced e2e environment: digital-twin Discord server,
  * opencode deterministic provider, database, bot client.
  * Each caller should use a unique channelId and dirName to avoid collisions
+ */
   channelName,
   extraChannels = [],
   dirName,
