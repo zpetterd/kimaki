@@ -2427,7 +2427,7 @@ export class ThreadSessionRuntime {
         }
         await showAskUserQuestionDropdowns({
           thread: this.thread,
-          sessionId,
+          sessionId: effectiveSessionId,
           directory: this.sdkDirectory,
           requestId: questionRequest.id,
           input: { questions: questionRequest.questions },
@@ -3883,9 +3883,11 @@ export class ThreadSessionRuntime {
     if (worktreeInfo?.status === 'ready' && worktreeInfo.worktree_directory) {
       const { recoverWorktreeDirectory } = await import('../worktrees.js')
       const recovery = await recoverWorktreeDirectory({ threadId: this.thread.id })
-      if (!recovery.recovered) {
+      if (recovery instanceof Error) {
+        logger.warn(`[WORKTREE] Worktree directory recovery error: ${recovery.message}`)
+      } else if (!recovery.recovered) {
         logger.warn(
-          `[WORKTREE] Worktree directory recovery failed: ${recovery.reason}${recovery.error ? ' - ' + recovery.error.message : ''}`,
+          `[WORKTREE] Worktree directory recovery failed: ${recovery.reason ?? 'unknown'}`,
         )
       }
     }
