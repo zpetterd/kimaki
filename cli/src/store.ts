@@ -94,14 +94,13 @@ export type KimakiState = {
   // Read by: discord-utils.ts hasKimakiBotPermission().
   allowAllUsers: boolean
 
-  // Permission button TTL in milliseconds. When a permission prompt is shown
-  // in Discord, buttons remain active for this duration before auto-rejecting.
-  // Defaults to 10 minutes. With continue_loop_on_deny enabled in the opencode
-  // config, a timeout rejection lets the model continue (try alternatives or
-  // explain it couldn't proceed) instead of killing the session.
-  // Changes: set once at startup from --permission-timeout-minutes CLI flag.
-  // Read by: commands/permissions.ts showPermissionButtons().
-  permissionTimeoutMs: number
+  // Interaction prompt TTL in milliseconds. When a permission or question prompt
+  // is shown in Discord, the prompt remains active for this duration before
+  // auto-rejecting. Defaults to 10 minutes.
+  // Changes: set once at startup from --interaction-timeout-minutes CLI flag or
+  // KIMAKI_INTERACTION_TIMEOUT_MINUTES env var.
+  // Read by: commands/permissions.ts, commands/ask-question.ts.
+  interactionTimeoutMs: number
 
   // Whether background sync of external OpenCode sessions is enabled.
   // When true (default), sessions started from the OpenCode CLI or TUI
@@ -164,7 +163,7 @@ export const store = createStore<KimakiState>(() => ({
   disabledSkills: [],
   allowedMentions: ['users'],
   allowAllUsers: false,
-  permissionTimeoutMs: 10 * 60 * 1000,
+  interactionTimeoutMs: 10 * 60 * 1000,
   syncEnabled: true,
   discordBaseUrl: 'https://discord.com',
   gatewayToken: null,

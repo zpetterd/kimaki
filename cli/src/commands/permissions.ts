@@ -18,7 +18,7 @@ import {
 import crypto from 'node:crypto'
 import type { OpencodeClient, PermissionRequest } from '@opencode-ai/sdk/v2'
 import { getOpencodeClient } from '../opencode.js'
-import { getPermissionTimeoutMs } from '../config.js'
+import { getInteractionTimeoutMs } from '../config.js'
 import { NOTIFY_MESSAGE_FLAGS } from '../discord-utils.js'
 import { createLogger, LogPrefix } from '../logger.js'
 
@@ -109,7 +109,7 @@ type PendingPermissionContext = {
 
 // Store pending permission contexts by hash.
 // TTL prevents unbounded growth if user never clicks a permission button.
-// Configurable via --permission-timeout-minutes CLI flag (default: 10 minutes).
+// Configurable via --interaction-timeout-minutes CLI flag (default: 10 minutes).
 export const pendingPermissionContexts = new Map<string, PendingPermissionContext>()
 
 // Atomic take: removes context from Map and returns it. Only the first caller
@@ -155,7 +155,7 @@ export async function showPermissionButtons({
   // so only one of TTL-expiry or button-click can win.
   // With continue_loop_on_deny enabled in opencode config, the model sees
   // this as a tool error and continues (tries alternatives or explains).
-  const permissionTimeoutMs = getPermissionTimeoutMs()
+  const interactionTimeoutMs = getInteractionTimeoutMs()
   setTimeout(async () => {
     const ctx = takePendingPermissionContext(contextHash)
     if (!ctx) {
@@ -181,13 +181,13 @@ export async function showPermissionButtons({
       ).catch((error) => {
         logger.error('Failed to auto-reject expired permission:', error)
       })
-      const minutes = Math.round(permissionTimeoutMs / 60_000)
+      const minutes = Math.round(interactionTimeoutMs / 60_000)
       updatePermissionMessage({
         context: ctx,
         status: `_Permission expired after ${minutes} minute${minutes !== 1 ? 's' : ''} and was rejected._`,
       })
     }
-  }, permissionTimeoutMs).unref()
+  }, interactionTimeoutMs).unref()
 
   const patternStr = compactPermissionPatterns(permission.patterns).join(', ')
 

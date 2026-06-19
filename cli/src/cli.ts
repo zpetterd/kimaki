@@ -56,8 +56,8 @@ cli
     'Allow all Discord users to start sessions without needing Kimaki role or admin permissions (no-kimaki role still blocks)',
   )
   .option(
-    '--permission-timeout-minutes <minutes>',
-    'Permission prompt timeout in minutes before auto-rejecting (default: 10)',
+    '--interaction-timeout-minutes <minutes>',
+    'Interaction prompt timeout in minutes before auto-rejecting. Also configurable via KIMAKI_INTERACTION_TIMEOUT_MINUTES env var. Affects both permission buttons and question dropdowns (default: 10)',
   )
   .option('--disable-sync', 'Disable background sync of external OpenCode sessions into Discord')
   .option('--no-sentry', 'Disable Sentry error reporting')
@@ -215,15 +215,17 @@ cli
           }
         }
 
-        // --permission-timeout-minutes validation
+        // --interaction-timeout-minutes validation
         // Node setTimeout max is 2_147_483_647ms; larger values fire immediately.
         const MAX_TIMEOUT_MINUTES = Math.floor(2_147_483_647 / 60_000)
-        const permissionTimeoutMs = (() => {
-          if (!options.permissionTimeoutMinutes) return undefined
-          const parsed = Number(options.permissionTimeoutMinutes)
+        const resolvedInteractionTimeoutMinutes =
+          options.interactionTimeoutMinutes || process.env['KIMAKI_INTERACTION_TIMEOUT_MINUTES']
+        const interactionTimeoutMs = (() => {
+          if (!resolvedInteractionTimeoutMinutes) return undefined
+          const parsed = Number(resolvedInteractionTimeoutMinutes)
           if (!Number.isInteger(parsed) || parsed <= 0 || parsed > MAX_TIMEOUT_MINUTES) {
             cliLogger.error(
-              `Invalid permission timeout: ${options.permissionTimeoutMinutes}. Must be a positive whole number of minutes (max ${MAX_TIMEOUT_MINUTES}).`,
+              `Invalid interaction timeout: ${resolvedInteractionTimeoutMinutes}. Must be a positive whole number of minutes (max ${MAX_TIMEOUT_MINUTES}).`,
             )
             process.exit(EXIT_NO_RESTART)
           }
@@ -236,7 +238,7 @@ cli
           ...(options.mentionMode && { defaultMentionMode: true }),
           ...(options.noCritique && { critiqueEnabled: false }),
           ...(options.allowAllUsers && { allowAllUsers: true }),
-          ...(permissionTimeoutMs !== undefined && { permissionTimeoutMs }),
+          ...(interactionTimeoutMs !== undefined && { interactionTimeoutMs }),
           ...(options.disableSync && { syncEnabled: false }),
           ...(enabledSkills.length > 0 && { enabledSkills }),
           ...(disabledSkills.length > 0 && { disabledSkills }),
@@ -257,12 +259,8 @@ cli
             'Allow all users: any Discord member can start sessions (no-kimaki role still blocks)',
           )
         }
-        if (permissionTimeoutMs !== undefined) {
-          cliLogger.log(`Permission timeout set to ${options.permissionTimeoutMinutes} minutes`)
-        }
-
-        if (permissionTimeoutMs !== undefined) {
-          cliLogger.log(`Permission timeout set to ${options.permissionTimeoutMinutes} minutes`)
+        if (interactionTimeoutMs !== undefined) {
+          cliLogger.log(`Interaction timeout set to ${resolvedInteractionTimeoutMinutes} minutes`)
         }
 
         if (options.verbosity) {
