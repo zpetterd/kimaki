@@ -190,6 +190,7 @@ export async function showPermissionButtons({
   }, permissionTimeoutMs).unref()
 
   const patternStr = compactPermissionPatterns(permission.patterns).join(', ')
+  const alwaysStr = compactPermissionPatterns(permission.always).join(', ')
 
   // Build 3 buttons for permission actions
   const acceptButton = new ButtonBuilder()
@@ -218,12 +219,14 @@ export async function showPermissionButtons({
     permission.permission === 'external_directory'
       ? `Agent is accessing files outside the project. [Learn more](https://opencode.ai/docs/permissions/#external-directories)\n`
       : ''
+  const alwaysLine = alwaysStr ? `**Always Allowed:** \`${alwaysStr}\`` : ''
   const fullContent =
     `⚠️ **Permission Required**\n` +
     subtaskLine +
     `**Type:** \`${permission.permission}\`\n` +
     externalDirLine +
-    (patternStr ? `**Pattern:** \`${patternStr}\`` : '')
+    (patternStr ? `**Pattern:** \`${patternStr}\`\n` : '') +
+    alwaysLine
   const permissionMessage = await thread.send({
     content: fullContent.slice(0, 1900),
     components: [actionRow],
@@ -251,6 +254,8 @@ function updatePermissionMessage({
     .fetch(context.messageId)
     .then((message) => {
       const patternStr = compactPermissionPatterns(context.permission.patterns).join(', ')
+      const alwaysStr = compactPermissionPatterns(context.permission.always).join(', ')
+      const alwaysLine = alwaysStr ? `**Always Allowed:** \`${alwaysStr}\`\n` : ''
       const externalDirLine =
         context.permission.permission === 'external_directory'
           ? 'Agent is accessing files outside the project. [Learn more](https://opencode.ai/docs/permissions/#external-directories)\n'
@@ -261,6 +266,7 @@ function updatePermissionMessage({
           `**Type:** \`${context.permission.permission}\`\n` +
           externalDirLine +
           (patternStr ? `**Pattern:** \`${patternStr}\`\n` : '') +
+          alwaysLine +
           status,
         components: [],
       })
