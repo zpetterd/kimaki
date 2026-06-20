@@ -98,6 +98,7 @@ import {
   hasAssistantMessageCompletedBefore,
   isAssistantMessageInLatestUserTurn,
   isAssistantMessageNaturalCompletion,
+  isStaleEventForSession,
   type EventBufferEvent,
   type EventBufferEntry,
 } from './event-stream-state.js'
@@ -1277,8 +1278,8 @@ export class ThreadSessionRuntime {
 
     // Drop events that don't match current session (stale events from
     // previous sessions), unless it's a global event or a subtask session.
-    if (!isGlobalEvent && eventSessionId && eventSessionId !== sessionId) {
-      if (!this.getSubtaskInfoForSession(eventSessionId)) {
+    if (isStaleEventForSession({ isGlobalEvent, eventSessionId, sessionId })) {
+      if (!this.getSubtaskInfoForSession(eventSessionId!)) {
         return // stale event from previous session
       }
     }
