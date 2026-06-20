@@ -20,6 +20,7 @@ import {
   isAssistantMessageInLatestUserTurn,
   isAssistantMessageNaturalCompletion,
   isSessionBusy,
+  isStaleEventForSession,
   type EventBufferEntry,
 } from './event-stream-state.js'
 
@@ -832,5 +833,55 @@ describe('real-session-footer-suppressed-on-pre-idle-interrupt', () => {
       sessionId,
       messageId: latestAssistantId,
     })).toBe(true)
+  })
+})
+
+describe('isStaleEventForSession', () => {
+  test('returns true when event belongs to a different session', () => {
+    expect(isStaleEventForSession({
+      isGlobalEvent: false,
+      eventSessionId: 'ses_other',
+      sessionId: 'ses_active',
+    })).toBe(true)
+  })
+
+  test('returns false when eventSessionId matches sessionId', () => {
+    expect(isStaleEventForSession({
+      isGlobalEvent: false,
+      eventSessionId: 'ses_active',
+      sessionId: 'ses_active',
+    })).toBe(false)
+  })
+
+  test('returns false when sessionId is undefined (no active session — bug fix)', () => {
+    expect(isStaleEventForSession({
+      isGlobalEvent: false,
+      eventSessionId: 'ses_some',
+      sessionId: undefined,
+    })).toBe(false)
+  })
+
+  test('returns false when eventSessionId is undefined', () => {
+    expect(isStaleEventForSession({
+      isGlobalEvent: false,
+      eventSessionId: undefined,
+      sessionId: 'ses_active',
+    })).toBe(false)
+  })
+
+  test('returns false for global events regardless of session mismatch', () => {
+    expect(isStaleEventForSession({
+      isGlobalEvent: true,
+      eventSessionId: 'ses_other',
+      sessionId: 'ses_active',
+    })).toBe(false)
+  })
+
+  test('returns false when both sessionId and eventSessionId are undefined', () => {
+    expect(isStaleEventForSession({
+      isGlobalEvent: false,
+      eventSessionId: undefined,
+      sessionId: undefined,
+    })).toBe(false)
   })
 })

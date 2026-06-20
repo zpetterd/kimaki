@@ -103,6 +103,23 @@ export type DerivedSubagentSession = {
   timestamp: number
 }
 
+// Returns true when the event clearly belongs to a different session than the
+// active one (not global, has an eventSessionId, has an active sessionId, and
+// they don't match). The caller still needs to check subtask routing before
+// dropping. When sessionId is undefined (no active session), returns false so
+// interactive events like permission.asked are not silently dropped.
+export function isStaleEventForSession({
+  isGlobalEvent,
+  eventSessionId,
+  sessionId,
+}: {
+  isGlobalEvent: boolean
+  eventSessionId: string | undefined
+  sessionId: string | undefined
+}): boolean {
+  return !isGlobalEvent && !!eventSessionId && !!sessionId && eventSessionId !== sessionId
+}
+
 // Scans backward for most recent session-scoped lifecycle event.
 // Returns true if the latest lifecycle event for sessionId is session.status busy.
 export function isSessionBusy({
