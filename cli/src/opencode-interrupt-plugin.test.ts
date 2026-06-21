@@ -327,6 +327,26 @@ describe('interruptOpencodeSessionOnUserMessage', () => {
     ])
   })
 
+  test('does not schedule interrupt when session is idle', async () => {
+    process.env['KIMAKI_INTERRUPT_STEP_TIMEOUT_MS'] = '20'
+
+    const { chatHook } = await requireHooks()
+    const sessionID = 'ses-idle'
+    const messageID = 'msg-idle'
+
+    // Session is idle — nothing to interrupt.
+    stub.setStatus(sessionID, { type: 'idle' })
+
+    await chatHook(
+      { sessionID, messageID } as InterruptChatInput,
+      createChatOutput({ sessionID, messageID }),
+    )
+    await delay({ ms: 60 })
+
+    expect(stub.abortCalls).toEqual([])
+    expect(stub.promptAsyncCalls).toEqual([])
+  })
+
   test('drains multiple queued messages in order', async () => {
     process.env['KIMAKI_INTERRUPT_STEP_TIMEOUT_MS'] = '20'
 
@@ -352,10 +372,7 @@ describe('interruptOpencodeSessionOnUserMessage', () => {
     await delay({ ms: 300 })
 
     expect(stub.abortCalls).toEqual([{ sessionID }, { sessionID }])
-    expect(stub.promptAsyncCalls.map((c) => c.messageID)).toEqual([
-      firstMessageID,
-      secondMessageID,
-    ])
+    expect(stub.promptAsyncCalls.map((c) => c.messageID)).toEqual([firstMessageID, secondMessageID])
   })
 
   test('preserves agent and model overrides on replay', async () => {
