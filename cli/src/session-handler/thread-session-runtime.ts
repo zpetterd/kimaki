@@ -623,8 +623,11 @@ export class ThreadSessionRuntime {
   private static EVENT_BUFFER_MAX = 1000
   private static EVENT_BUFFER_DB_FLUSH_MS = 2_000
   private static EVENT_BUFFER_TEXT_MAX_CHARS = 512
+  private static SESSION_STUCK_TIMEOUT_MS = 5 * 60 * 1_000 // 5 minutes
+  private static SESSION_STUCK_TOOL_RUNNING_TIMEOUT_MS = 30 * 60 * 1_000 // 30 minutes
   private eventBuffer: EventBufferEntry[] = []
   private nextEventIndex = 0
+  private lastEventAppendTime = 0
   private persistEventBufferDebounced: ReturnType<typeof createDebouncedProcessFlush>
   private readonly sentPartIdsBootstrap: Promise<void>
 
@@ -802,6 +805,7 @@ export class ThreadSessionRuntime {
     this.eventBuffer = hydratedEvents.slice(-ThreadSessionRuntime.EVENT_BUFFER_MAX)
     const lastHydratedEvent = this.eventBuffer[this.eventBuffer.length - 1]
     this.nextEventIndex = lastHydratedEvent ? Number(lastHydratedEvent.eventIndex || 0) + 1 : 0
+    this.lastEventAppendTime = Date.now()
     logger.log(
       `[SESSION EVENT DB] Hydrated ${this.eventBuffer.length} events for session ${sessionId}`,
     )
@@ -936,6 +940,7 @@ export class ThreadSessionRuntime {
     // instead of waiting for the runtime object itself to become unreachable.
     this.eventBuffer = []
     this.nextEventIndex = 0
+    this.lastEventAppendTime = 0
     this.partBuffer.clear()
     this.preprocessChain = Promise.resolve()
 
@@ -1115,6 +1120,7 @@ export class ThreadSessionRuntime {
     }
 
     const timestamp = Date.now()
+    this.lastEventAppendTime = timestamp
     const eventIndex = this.nextEventIndex
     this.nextEventIndex += 1
     this.eventBuffer.push({
@@ -1442,6 +1448,62 @@ export class ThreadSessionRuntime {
     return isSessionBusy({ events: this.eventBuffer, sessionId })
   }
 
+  private checkSessionStuckWatchdog(): boolean {
+    if (this.lastEventAppendTime === 0) {
+      return false
+    }
+    const sessionId = this.state?.sessionId
+    if (!sessionId) {
+      return false
+    }
+    if (!isSessionBusy({ events: this.eventBuffer, sessionId })) {
+      return false
+    }
+    const elapsed = Date.now() - this.lastEventAppendTime
+    const isWaitingOnTool = this.isLastBufferedEventToolRunning()
+    const timeoutMs = isWaitingOnTool
+      ? ThreadSessionRuntime.SESSION_STUCK_TOOL_RUNNING_TIMEOUT_MS
+      : ThreadSessionRuntime.SESSION_STUCK_TIMEOUT_MS
+    if (elapsed < timeoutMs) {
+      return false
+    }
+    const contextLabel = isWaitingOnTool ? ' while a tool is running' : ''
+    logger.warn(
+      `[WATCHDOG] Session stuck for ${Math.round(elapsed / 1000)}s${contextLabel} with no events. Aborting and injecting synthetic idle. sessionId=${sessionId} ${this.formatRunStateForLog()}`,
+    )
+    this.stopTyping()
+    void this.abortSessionViaApi({
+      abortId: this.nextAbortId('watchdog-stuck-session'),
+      reason: 'session stuck watchdog: no events for ' + Math.round(elapsed / 1000) + 's',
+      sessionId,
+    })
+    this.markQueueDispatchIdle(sessionId)
+    void this.tryDrainQueue({ showIndicator: true })
+    void sendThreadMessage(
+      this.thread,
+      `Session appears unresponsive (no activity for ${Math.round(elapsed / 1000 / 60)} minutes${contextLabel}). Session has been reset — your next message will start a fresh run.`,
+      { flags: NOTIFY_MESSAGE_FLAGS },
+    ).catch((e) => {
+      logger.error('[WATCHDOG] Failed to send stuck notification:', e)
+    })
+    return true
+  }
+
+  private isLastBufferedEventToolRunning(): boolean {
+    for (let i = this.eventBuffer.length - 1; i >= 0; i--) {
+      const entry = this.eventBuffer[i]
+      if (!entry) continue
+      const e = entry.event
+      if (e.type !== 'message.part.updated') continue
+      const part = e.properties.part
+      if (part.type === 'tool' && part.state?.status === 'running') {
+        return true
+      }
+      return false
+    }
+    return false
+  }
+
   private async sendTypingPulse(): Promise<void> {
     const result = await this.thread
       .sendTyping()
@@ -1468,6 +1530,9 @@ export class ThreadSessionRuntime {
       void (async () => {
         if (!this.shouldTypeNow()) {
           this.stopTyping()
+          return
+        }
+        if (this.checkSessionStuckWatchdog()) {
           return
         }
         await this.sendTypingPulse()
