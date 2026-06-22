@@ -109,7 +109,7 @@ cli
       mentionMode?: boolean
       noCritique?: boolean
       allowAllUsers?: boolean
-      permissionTimeoutMinutes?: string
+      interactionTimeoutMinutes?: string
       disableSync?: boolean
       autoRestart?: boolean
       noSentry?: boolean
