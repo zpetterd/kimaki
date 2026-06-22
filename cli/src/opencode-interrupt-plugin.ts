@@ -181,8 +181,30 @@ const interruptOpencodeSessionOnUserMessage: Plugin = async (ctx) => {
         finalStatus: idleResult.finalStatus,
         pollTimeoutMs: ABORT_IDLE_POLL_TIMEOUT_MS,
       })
-      // On timeout we still replay rather than silently dropping the user's
-      // message: a queued promptAsync runs after the current turn anyway.
+
+      // Verify the session is truly idle and ready for a new prompt. After
+      // session.abort() the session enters a transient state — it may report
+      // idle in the status map but still be cleaning up internal state. If the
+      // session is still busy after the poll timeout, wait a few more seconds
+      // before attempting replay to avoid calling promptAsync on a session that
+      // is not yet ready.
+      if (!idleResult.becameIdle && idleResult.finalStatus === 'busy') {
+        log('warn', 'session still busy after abort timeout, waiting before replay', {
+          sessionID,
+          messageID,
+          finalStatus: idleResult.finalStatus,
+        })
+        await delay(2_000)
+        const retryResponse = await client.session.status({ directory })
+        const retryStatus = retryResponse.data?.[sessionID]
+        const retryType = retryStatus?.type ?? 'idle'
+        if (retryType === 'busy') {
+          log('warn', 'session still busy after extra wait, proceeding with replay anyway', {
+            sessionID,
+            messageID,
+          })
+        }
+      }
 
       const current = pending.get(messageID)
       if (!current) {
@@ -208,12 +230,24 @@ const interruptOpencodeSessionOnUserMessage: Plugin = async (ctx) => {
       // scheduling a new interrupt timer for this message.
       replayedMessageIds.add(messageID)
       clearPending(messageID)
-      await client.session.promptAsync(replayParams)
-      log('info', 'replayed queued message', {
-        sessionID,
-        messageID,
-        replayPartCount: current.parts.length,
-      })
+      try {
+        await client.session.promptAsync(replayParams)
+        log('info', 'replayed queued message', {
+          sessionID,
+          messageID,
+          replayPartCount: current.parts.length,
+        })
+      } catch (error) {
+        log('error', 'promptAsync replay failed', {
+          sessionID,
+          messageID,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        // Do NOT rethrow — the abort message (MessageAbortedError) was already
+        // created. If replay fails we've dropped the user's message but the
+        // session is still in a valid state. Re-throwing would prevent draining
+        // the next queued message.
+      }
     } catch (error) {
       log('error', 'abort+replay threw', {
         sessionID,
