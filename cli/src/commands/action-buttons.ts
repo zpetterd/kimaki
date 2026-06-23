@@ -18,14 +18,13 @@ import {
   resolveWorkingDirectory,
   sendThreadMessage,
 } from '../discord-utils.js'
+import { getInteractionTimeoutMs } from '../config.js'
 import { createLogger } from '../logger.js'
 import { notifyError } from '../sentry.js'
-import {
-  getOrCreateRuntime,
-} from '../session-handler/thread-session-runtime.js'
+import { getOrCreateRuntime } from '../session-handler/thread-session-runtime.js'
 
 const logger = createLogger('ACT_BTN')
-const PENDING_TTL_MS = 24 * 60 * 60 * 1000
+const PENDING_TTL_MS = getInteractionTimeoutMs()
 
 export type ActionButtonColor = 'white' | 'blue' | 'green' | 'red'
 
@@ -52,15 +51,9 @@ type PendingActionButtonsContext = {
   timer: ReturnType<typeof setTimeout>
 }
 
-export const pendingActionButtonContexts = new Map<
-  string,
-  PendingActionButtonsContext
->()
+export const pendingActionButtonContexts = new Map<string, PendingActionButtonsContext>()
 const pendingActionButtonRequests = new Map<string, ActionButtonsRequest>()
-const pendingActionButtonRequestWaiters = new Map<
-  string,
-  (request: ActionButtonsRequest) => void
->()
+const pendingActionButtonRequestWaiters = new Map<string, (request: ActionButtonsRequest) => void>()
 
 export function queueActionButtonsRequest(request: ActionButtonsRequest): void {
   pendingActionButtonRequests.set(request.sessionId, request)
@@ -250,9 +243,7 @@ export async function showActionButtons({
     })
 
     context.messageId = message.id
-    logger.log(
-      `Showed ${safeButtons.length} action button(s) for session ${sessionId}`,
-    )
+    logger.log(`Showed ${safeButtons.length} action button(s) for session ${sessionId}`)
   } catch (error) {
     clearTimeout(timer)
     pendingActionButtonContexts.delete(contextHash)
@@ -260,9 +251,7 @@ export async function showActionButtons({
   }
 }
 
-export async function handleActionButton(
-  interaction: ButtonInteraction,
-): Promise<void> {
+export async function handleActionButton(interaction: ButtonInteraction): Promise<void> {
   const customId = interaction.customId
   if (!customId.startsWith('action_button:')) {
     return
@@ -329,10 +318,7 @@ export async function handleActionButton(
   const username = interaction.user.globalName || interaction.user.username
   const prompt = `User clicked: ${button.label}`
 
-  await sendThreadMessage(
-    thread,
-    `» **${username}:** ${button.label}`,
-  )
+  await sendThreadMessage(thread, `» **${username}:** ${button.label}`)
 
   try {
     await sendClickedActionToModel({

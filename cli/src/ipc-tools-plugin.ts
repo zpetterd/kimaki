@@ -12,7 +12,7 @@ import type { Plugin } from '@opencode-ai/plugin'
 import type { ToolContext } from '@opencode-ai/plugin/tool'
 import dedent from 'string-dedent'
 import { z } from 'zod'
-import { setDataDir } from './config.js'
+import { getInteractionTimeoutMs, setDataDir } from './config.js'
 import { createPluginLogger, setPluginLogFilePath } from './plugin-logger.js'
 import { initSentry } from './sentry.js'
 
@@ -30,10 +30,7 @@ import { initSentry } from './sentry.js'
 function tool<Args extends z.ZodRawShape>(input: {
   description: string
   args: Args
-  execute(
-    args: z.infer<z.ZodObject<Args>>,
-    context: ToolContext,
-  ): Promise<string>
+  execute(args: z.infer<z.ZodObject<Args>>, context: ToolContext): Promise<string>
 }) {
   return input
 }
@@ -42,7 +39,6 @@ const logger = createPluginLogger('OPENCODE')
 
 const FILE_UPLOAD_TIMEOUT_MS = 6 * 60 * 1000
 const DEFAULT_FILE_UPLOAD_MAX_FILES = 5
-const ACTION_BUTTON_TIMEOUT_MS = 30 * 1000
 
 async function loadDatabaseModule() {
   // The plugin-loading e2e test boots OpenCode directly without the bot-side
@@ -60,11 +56,11 @@ async function loadDatabaseModule() {
 const ipcToolsPlugin: any = async () => {
   initSentry()
 
-    const dataDir = process.env.KIMAKI_DATA_DIR
-    if (dataDir) {
-      setDataDir(dataDir)
-      setPluginLogFilePath(dataDir)
-    }
+  const dataDir = process.env.KIMAKI_DATA_DIR
+  if (dataDir) {
+    setDataDir(dataDir)
+    setPluginLogFilePath(dataDir)
+  }
 
   return {
     tool: {
@@ -76,22 +72,17 @@ const ipcToolsPlugin: any = async () => {
           'Use this when you need the user to provide files (images, documents, configs, etc.). ' +
           'IMPORTANT: Always call this tool last in your message, after all text parts.',
         args: {
-          prompt: z
-            .string()
-            .describe(
-              'Message shown to the user explaining what files to upload',
-            ),
+          prompt: z.string().describe('Message shown to the user explaining what files to upload'),
           maxFiles: z
             .number()
             .min(1)
             .max(10)
             .optional()
-            .describe(
-              'Maximum number of files the user can upload (1-10, default 5)',
-            ),
+            .describe('Maximum number of files the user can upload (1-10, default 5)'),
         },
         async execute({ prompt, maxFiles }, context) {
-          const { getThreadIdBySessionId, createIpcRequest, getIpcRequestById } = await loadDatabaseModule()
+          const { getThreadIdBySessionId, createIpcRequest, getIpcRequestById } =
+            await loadDatabaseModule()
           const threadId = await getThreadIdBySessionId(context.sessionID)
 
           if (!threadId) {
@@ -117,7 +108,7 @@ const ipcToolsPlugin: any = async () => {
             })
             const updated = await getIpcRequestById({ id: ipcRow.id })
             if (!updated || updated.status === 'cancelled') {
-              return 'File upload was cancelled'
+              return 'No files were uploaded: File upload was cancelled. User did not provide any files.'
             }
             if (updated.response) {
               const parsed = JSON.parse(updated.response) as {
@@ -135,7 +126,7 @@ const ipcToolsPlugin: any = async () => {
             }
           }
 
-          return 'File upload timed out - user did not upload files within the time limit'
+          return 'No files were uploaded: File upload timed out. User did not provide any files within the time limit.'
         },
       }),
       kimaki_action_buttons: tool({
@@ -174,12 +165,11 @@ const ipcToolsPlugin: any = async () => {
             )
             .min(1)
             .max(3)
-            .describe(
-              'Array of 1-3 action buttons. Prefer one button whenever possible.',
-            ),
+            .describe('Array of 1-3 action buttons. Prefer one button whenever possible.'),
         },
         async execute({ buttons }, context) {
-          const { getThreadIdBySessionId, createIpcRequest, getIpcRequestById } = await loadDatabaseModule()
+          const { getThreadIdBySessionId, createIpcRequest, getIpcRequestById } =
+            await loadDatabaseModule()
           const threadId = await getThreadIdBySessionId(context.sessionID)
 
           if (!threadId) {
@@ -196,7 +186,7 @@ const ipcToolsPlugin: any = async () => {
             }),
           })
 
-          const deadline = Date.now() + ACTION_BUTTON_TIMEOUT_MS
+          const deadline = Date.now() + getInteractionTimeoutMs()
           const POLL_INTERVAL_MS = 200
           while (Date.now() < deadline) {
             await new Promise((resolve) => {
@@ -204,7 +194,7 @@ const ipcToolsPlugin: any = async () => {
             })
             const updated = await getIpcRequestById({ id: ipcRow.id })
             if (!updated || updated.status === 'cancelled') {
-              return 'Action button request was cancelled'
+              return 'No selection was made: Action button request was cancelled'
             }
             if (updated.response) {
               const parsed = JSON.parse(updated.response) as {
@@ -218,7 +208,7 @@ const ipcToolsPlugin: any = async () => {
             }
           }
 
-          return 'Action button request timed out'
+          return 'No selection was made: Action button request timed out. Do not assume any button was selected.'
         },
       }),
     },
