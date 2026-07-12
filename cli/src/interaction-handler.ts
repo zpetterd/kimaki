@@ -94,6 +94,7 @@ import {
   handleQueueCommandAutocomplete,
 } from './commands/queue.js'
 import { handleUndoCommand, handleRedoCommand } from './commands/undo-redo.js'
+import { handleArchiveThreadCommand } from './commands/archive-thread.js'
 import { handleUserCommand } from './commands/user-command.js'
 import {
   handleVerbosityCommand,
@@ -415,6 +416,10 @@ export function registerInteractionHandler({
 
             case 'redo':
               await handleRedoCommand({ command: interaction, appId })
+              return
+
+            case 'archive-thread':
+              await handleArchiveThreadCommand({ command: interaction, appId })
               return
 
             case 'verbosity':

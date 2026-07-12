@@ -16,6 +16,7 @@ import {
   sanitizeAgentName,
   buildQuickAgentCommandDescription,
 } from './commands/agent.js'
+import { archiveThreadSlashCommand } from './commands/archive-thread.js'
 import { isSkillAllowed } from './skill-filter.js'
 
 const cliLogger = createLogger(LogPrefix.CLI)
@@ -397,6 +398,11 @@ export async function registerCommands({
     new SlashCommandBuilder()
       .setName('redo')
       .setDescription(truncateCommandDescription('Redo previously undone changes'))
+      .setDMPermission(false)
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('archive-thread')
+      .setDescription(truncateCommandDescription('Immediately archive this thread without confirmation'))
       .setDMPermission(false)
       .toJSON(),
     new SlashCommandBuilder()
