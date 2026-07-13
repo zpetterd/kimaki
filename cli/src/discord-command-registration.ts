@@ -482,6 +482,19 @@ export async function registerCommands({
       )
       .setDMPermission(false)
       .toJSON(),
+    new SlashCommandBuilder()
+      .setName('recover')
+      .setDescription(truncateCommandDescription('Recover a lost session by restoring conversation from Discord thread'))
+      .addStringOption((option) => {
+        option
+          .setName('thread')
+          .setDescription(truncateCommandDescription('Thread ID or link to recover (default: current thread)'))
+          .setRequired(false)
+
+        return option
+      })
+      .setDMPermission(false)
+      .toJSON(),
   ]
 
   // Dynamic commands are registered in priority order: agents → user commands → skills → MCP prompts.

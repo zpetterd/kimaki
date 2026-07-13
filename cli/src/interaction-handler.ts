@@ -112,6 +112,7 @@ import {
   handleScreenshareStopCommand,
 } from './commands/screenshare.js'
 import { handleVscodeCommand } from './commands/vscode.js'
+import { handleRecoverCommand } from './commands/recover.js'
 import { handleModelVariantSelectMenu } from './commands/model.js'
 import {
   handleModelVariantCommand,
@@ -485,6 +486,10 @@ export function registerInteractionHandler({
 
             case 'vscode':
               await handleVscodeCommand({ command: interaction, appId })
+              return
+
+            case 'recover':
+              await handleRecoverCommand({ command: interaction, appId })
               return
           }
 
