@@ -74,12 +74,12 @@ export function setProjectsDir(dir: string): void {
 }
 
 /**
- * Get the permission button timeout in milliseconds.
- * How long permission buttons remain active before auto-rejecting.
- * Defaults to 10 minutes (600000ms).
+ * Get the interaction prompt timeout in milliseconds.
+ * How long permission buttons and question dropdowns remain active before
+ * auto-rejecting. Defaults to 10 minutes (600000ms).
  */
-export function getPermissionTimeoutMs(): number {
-  return store.getState().permissionTimeoutMs
+export function getInteractionTimeoutMs(): number {
+  return store.getState().interactionTimeoutMs
 }
 
 export type { RegisteredUserCommand } from './store.js'

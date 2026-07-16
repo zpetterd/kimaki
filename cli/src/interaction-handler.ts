@@ -71,6 +71,7 @@ import {
   handleQueueCommandAutocomplete,
 } from './commands/queue.js'
 import { handleUndoCommand, handleRedoCommand } from './commands/undo-redo.js'
+import { handleArchiveThreadCommand } from './commands/archive-thread.js'
 import { handleUserCommand } from './commands/user-command.js'
 import { handleVerbosityCommand, handleVerbositySelectMenu } from './commands/verbosity.js'
 import { handleRestartOpencodeServerCommand } from './commands/restart-opencode-server.js'
@@ -83,6 +84,7 @@ import { handleUpgradeAndRestartCommand } from './commands/upgrade.js'
 import { handleMcpCommand, handleMcpSelectMenu } from './commands/mcp.js'
 import { handleScreenshareCommand, handleScreenshareStopCommand } from './commands/screenshare.js'
 import { handleVscodeCommand } from './commands/vscode.js'
+import { handleRecoverCommand } from './commands/recover.js'
 import { handleModelVariantSelectMenu } from './commands/model.js'
 import {
   handleModelVariantCommand,
@@ -92,8 +94,54 @@ import {
 import { hasKimakiAdminPermission, hasKimakiBotPermission } from './discord-utils.js'
 import { createLogger, LogPrefix } from './logger.js'
 import { notifyError } from './sentry.js'
+import { getChannelDirectory } from './database.js'
 
 const interactionLogger = createLogger(LogPrefix.INTERACTION)
+
+/** Setup commands that should reply with guidance when used in
+ * non-project channels, instead of silently ignoring. */
+const SETUP_COMMANDS = new Set([
+  'add-project',
+  'create-new-project',
+])
+
+/**
+ * Check if the interaction's channel is owned by this machine (has a project
+ * directory configured in the local sqlite db). For threads, checks the parent
+ * channel. Returns true if owned, false if not (another machine should handle it).
+ */
+async function isInteractionOwnedByThisMachine(
+  interaction: Interaction,
+): Promise<boolean> {
+  const channelId = interaction.channelId
+  if (!channelId) return false
+
+  // Direct channel lookup
+  const channelConfig = await getChannelDirectory(channelId)
+  if (channelConfig) return true
+
+  // If in a thread, check the parent channel
+  const cachedParentId = interaction.channel?.isThread()
+    ? interaction.channel.parentId
+    : null
+  if (cachedParentId) {
+    const parentConfig = await getChannelDirectory(cachedParentId)
+    if (parentConfig) return true
+  }
+
+  // When channel isn't cached (common with gateway-proxy), fetch it to get parentId
+  if (!cachedParentId) {
+    const fetched = await interaction.client.channels
+      .fetch(channelId)
+      .catch(() => null)
+    if (fetched?.isThread() && fetched.parentId) {
+      const parentConfig = await getChannelDirectory(fetched.parentId)
+      if (parentConfig) return true
+    }
+  }
+
+  return false
+}
 
 export function registerInteractionHandler({
   discordClient,
@@ -116,9 +164,324 @@ export function registerInteractionHandler({
         }`,
       )
 
+      // Multi-machine routing: only handle interactions for channels owned
+      // by this machine (have a project directory configured in local db).
+      // If not owned, silently return so the other machine handles it.
+      const owned = await isInteractionOwnedByThisMachine(interaction)
+      if (!owned) {
+        // Setup commands get a helpful reply instead of silent ignore.
+        // Both machines may race to reply; one wins, the other silently
+        // fails (interaction tokens are single-use). The message is the
+        // same from either machine so the race is harmless.
+        if (
+          interaction.isChatInputCommand() &&
+          SETUP_COMMANDS.has(interaction.commandName)
+        ) {
+          await interaction.reply({
+            content:
+              'Run this command in an existing Kimaki project channel.\nTo add a new project channel from the terminal, run:\n```\nkimaki project add /path/to/folder\n```',
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {
+            // Another machine already responded, safe to ignore
+          })
+          return
+        }
+
+        interactionLogger.log(
+          `[IGNORED] Channel ${interaction.channelId} has no project directory configured, skipping interaction`,
+        )
+        // Do not respond at all — consuming the interaction token would
+        // prevent the owning machine from responding (tokens are single-use).
+        return
+      }
+
       if (interaction.isAutocomplete()) {
         if (!hasKimakiBotPermission(interaction.member, interaction.guild)) {
           await interaction.respond([])
+          return
+        }
+
+        switch (interaction.commandName) {
+          case 'new-session':
+            await handleSessionAutocomplete({ interaction, appId })
+            return
+
+          case 'resume':
+            await handleResumeAutocomplete({ interaction, appId })
+            return
+
+          case 'add-project':
+            await handleAddProjectAutocomplete({ interaction, appId })
+            return
+
+          case 'remove-project':
+            await handleRemoveProjectAutocomplete({ interaction, appId })
+            return
+
+          case 'queue-command':
+            await handleQueueCommandAutocomplete({ interaction, appId })
+            return
+
+          case 'new-worktree':
+            await handleNewWorktreeAutocomplete({ interaction, appId })
+            return
+
+          case 'merge-worktree':
+            await handleMergeWorktreeAutocomplete({ interaction, appId })
+            return
+
+          default:
+            await interaction.respond([])
+            return
+        }
+      }
+
+      if (interaction.isChatInputCommand()) {
+        interactionLogger.log(
+          `[COMMAND] Processing: ${interaction.commandName}`,
+        )
+
+        if (!hasKimakiBotPermission(interaction.member, interaction.guild)) {
+          await interaction.reply({
+            content: `You don't have permission to use this command.\nTo use Kimaki, ask a server admin to give you the **Kimaki** role.`,
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
+
+        switch (interaction.commandName) {
+          case 'new-session':
+            await handleSessionCommand({ command: interaction, appId })
+            return
+
+          case 'new-worktree':
+            await handleNewWorktreeCommand({ command: interaction, appId })
+            return
+
+          case 'merge-worktree':
+            await handleMergeWorktreeCommand({ command: interaction, appId })
+            return
+
+          case 'toggle-worktrees':
+            await handleToggleWorktreesCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+          case 'worktrees':
+            await handleWorktreesCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+          case 'tasks':
+            await handleTasksCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+          case 'last-sessions':
+            await handleLastSessionsCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+
+          case 'resume':
+            await handleResumeCommand({ command: interaction, appId })
+            return
+
+          case 'add-project':
+            await handleAddProjectCommand({ command: interaction, appId })
+            return
+
+          case 'remove-project':
+            await handleRemoveProjectCommand({ command: interaction, appId })
+            return
+
+          case 'create-new-project':
+            await handleCreateNewProjectCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+          case 'abort':
+            await handleAbortCommand({ command: interaction, appId })
+            return
+
+          case 'add-dir':
+            await handleAddDirCommand({ command: interaction, appId })
+            return
+
+          case 'compact':
+            await handleCompactCommand({ command: interaction, appId })
+            return
+
+          case 'share':
+            await handleShareCommand({ command: interaction, appId })
+            return
+
+          case 'diff':
+            await handleDiffCommand({ command: interaction, appId })
+            return
+
+          case 'fork':
+            await handleForkCommand(interaction)
+            return
+
+          case 'fork-subagent':
+            await handleForkSubagentCommand(interaction)
+            return
+
+          case 'btw':
+            await handleBtwCommand({ command: interaction, appId })
+            return
+
+          case 'model':
+            await handleModelCommand({ interaction, appId })
+            return
+
+          case 'model-variant':
+            await handleModelVariantCommand({ interaction, appId })
+            return
+
+          case 'unset-model-override':
+            await handleUnsetModelCommand({ interaction, appId })
+            return
+
+          case 'login':
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure login credentials.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
+            await handleLoginCommand({ interaction, appId })
+            return
+
+          case 'agent':
+            await handleAgentCommand({ interaction, appId })
+            return
+
+          case 'queue':
+            await handleQueueCommand({ command: interaction, appId })
+            return
+
+          case 'clear-queue':
+            await handleClearQueueCommand({ command: interaction, appId })
+            return
+
+          case 'queue-command':
+            await handleQueueCommandCommand({ command: interaction, appId })
+            return
+
+          case 'undo':
+            await handleUndoCommand({ command: interaction, appId })
+            return
+
+          case 'redo':
+            await handleRedoCommand({ command: interaction, appId })
+            return
+
+          case 'archive-thread':
+            await handleArchiveThreadCommand({ command: interaction, appId })
+            return
+
+          case 'verbosity':
+            await handleVerbosityCommand({ command: interaction, appId })
+            return
+
+          case 'restart-opencode-server':
+            await handleRestartOpencodeServerCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+          case 'run-shell-command':
+            await handleRunCommand({ command: interaction, appId })
+            return
+
+          case 'context-usage':
+            await handleContextUsageCommand({ command: interaction, appId })
+            return
+
+          case 'session-id':
+            await handleSessionIdCommand({ command: interaction, appId })
+            return
+
+
+
+          case 'upgrade-and-restart':
+            await handleUpgradeAndRestartCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+          case 'transcription-key':
+            if (!hasKimakiAdminPermission(interaction.member, interaction.guild)) {
+              await interaction.reply({
+                content: `Only server admins or users with the **Kimaki** role can configure API keys.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
+            await handleTranscriptionApiKeyCommand({
+              interaction,
+              appId,
+            })
+            return
+
+          case 'mcp':
+            await handleMcpCommand({ command: interaction, appId })
+            return
+
+          case 'screenshare':
+            await handleScreenshareCommand({ command: interaction, appId })
+            return
+
+          case 'screenshare-stop':
+            await handleScreenshareStopCommand({
+              command: interaction,
+              appId,
+            })
+            return
+
+          case 'vscode':
+            await handleVscodeCommand({ command: interaction, appId })
+            return
+
+          case 'recover':
+            await handleRecoverCommand({ command: interaction, appId })
+            return
+        }
+
+        // Handle quick agent commands (ending with -agent suffix, but not the base /agent command)
+        if (
+          interaction.commandName.endsWith('-agent') &&
+          interaction.commandName !== 'agent'
+        ) {
+          await handleQuickAgentCommand({ command: interaction, appId })
+          return
+        }
+
+        // Handle user-defined commands (ending with -cmd, -skill, or -mcp-prompt suffix)
+        if (
+          interaction.commandName.endsWith('-cmd') ||
+          interaction.commandName.endsWith('-skill') ||
+          interaction.commandName.endsWith('-mcp-prompt')
+        ) {
+          await handleUserCommand({ command: interaction, appId })
+          return
+        }
+      }
           return
         }
 

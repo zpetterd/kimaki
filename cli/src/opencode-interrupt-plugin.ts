@@ -31,10 +31,7 @@ import type {
   AgentPartInput,
   SubtaskPartInput,
 } from '@opencode-ai/sdk/v2'
-import {
-  createPluginClient,
-  createPluginAppLogger,
-} from './plugin-opencode-client.js'
+import { createPluginClient, createPluginAppLogger } from './plugin-opencode-client.js'
 
 type PromptPartInput = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput
 
@@ -47,7 +44,7 @@ type PendingMessage = {
 }
 
 const LOG_SERVICE = 'kimaki-interrupt'
-const DEFAULT_INTERRUPT_STEP_TIMEOUT_MS = 3_000
+const DEFAULT_INTERRUPT_STEP_TIMEOUT_MS = 10_000
 
 // Poll session.status after abort until the session reports idle. cancel() sets
 // status to idle synchronously, so this usually resolves on the first poll.
@@ -63,13 +60,15 @@ function getInterruptStepTimeoutMs(): number {
 
 function toPromptParts(parts: Part[]): PromptPartInput[] {
   const PROMPT_PART_TYPES = new Set(['text', 'file', 'agent', 'subtask'])
-  return parts.filter((p): p is Part & { type: 'text' | 'file' | 'agent' | 'subtask' } =>
-    PROMPT_PART_TYPES.has(p.type),
-  ).map((p) => {
-    // Strip runtime-only fields (sessionID, messageID) that Part has but PartInput doesn't
-    const { sessionID: _s, messageID: _m, ...input } = p as Part & Record<string, unknown>
-    return input as PromptPartInput
-  })
+  return parts
+    .filter((p): p is Part & { type: 'text' | 'file' | 'agent' | 'subtask' } =>
+      PROMPT_PART_TYPES.has(p.type),
+    )
+    .map((p) => {
+      // Strip runtime-only fields (sessionID, messageID) that Part has but PartInput doesn't
+      const { sessionID: _s, messageID: _m, ...input } = p as Part & Record<string, unknown>
+      return input as PromptPartInput
+    })
 }
 
 function delay(ms: number): Promise<void> {
@@ -117,7 +116,11 @@ const interruptOpencodeSessionOnUserMessage: Plugin = async (ctx) => {
     }
   }
 
-  function schedulePending(messageID: string, entry: Omit<PendingMessage, 'timer'>, delayMs: number): void {
+  function schedulePending(
+    messageID: string,
+    entry: Omit<PendingMessage, 'timer'>,
+    delayMs: number,
+  ): void {
     clearPending(messageID)
     const timer = setTimeout(() => void interruptPendingMessage(messageID), delayMs)
     pending.set(messageID, { ...entry, timer })
@@ -178,8 +181,30 @@ const interruptOpencodeSessionOnUserMessage: Plugin = async (ctx) => {
         finalStatus: idleResult.finalStatus,
         pollTimeoutMs: ABORT_IDLE_POLL_TIMEOUT_MS,
       })
-      // On timeout we still replay rather than silently dropping the user's
-      // message: a queued promptAsync runs after the current turn anyway.
+
+      // Verify the session is truly idle and ready for a new prompt. After
+      // session.abort() the session enters a transient state — it may report
+      // idle in the status map but still be cleaning up internal state. If the
+      // session is still busy after the poll timeout, wait a few more seconds
+      // before attempting replay to avoid calling promptAsync on a session that
+      // is not yet ready.
+      if (!idleResult.becameIdle && idleResult.finalStatus === 'busy') {
+        log('warn', 'session still busy after abort timeout, waiting before replay', {
+          sessionID,
+          messageID,
+          finalStatus: idleResult.finalStatus,
+        })
+        await delay(2_000)
+        const retryResponse = await client.session.status({ directory })
+        const retryStatus = retryResponse.data?.[sessionID]
+        const retryType = retryStatus?.type ?? 'idle'
+        if (retryType === 'busy') {
+          log('warn', 'session still busy after extra wait, proceeding with replay anyway', {
+            sessionID,
+            messageID,
+          })
+        }
+      }
 
       const current = pending.get(messageID)
       if (!current) {
@@ -205,12 +230,24 @@ const interruptOpencodeSessionOnUserMessage: Plugin = async (ctx) => {
       // scheduling a new interrupt timer for this message.
       replayedMessageIds.add(messageID)
       clearPending(messageID)
-      await client.session.promptAsync(replayParams)
-      log('info', 'replayed queued message', {
-        sessionID,
-        messageID,
-        replayPartCount: current.parts.length,
-      })
+      try {
+        await client.session.promptAsync(replayParams)
+        log('info', 'replayed queued message', {
+          sessionID,
+          messageID,
+          replayPartCount: current.parts.length,
+        })
+      } catch (error) {
+        log('error', 'promptAsync replay failed', {
+          sessionID,
+          messageID,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        // Do NOT rethrow — the abort message (MessageAbortedError) was already
+        // created. If replay fails we've dropped the user's message but the
+        // session is still in a valid state. Re-throwing would prevent draining
+        // the next queued message.
+      }
     } catch (error) {
       log('error', 'abort+replay threw', {
         sessionID,
@@ -275,6 +312,25 @@ const interruptOpencodeSessionOnUserMessage: Plugin = async (ctx) => {
       if (pending.has(messageID)) {
         log('debug', 'chat.message skipped (already pending)', { sessionID, messageID })
         return
+      }
+
+      // Only schedule interrupt timers for messages that arrive while the
+      // session is already busy.  When a session is idle (e.g. after the bot
+      // aborts and redispatches a message), there is nothing to interrupt —
+      // scheduling a timer would abort the very message that just started
+      // processing, causing orphaned sub-agents and permanently stuck
+      // sessions.
+      try {
+        const statusResponse = await client.session.status({ directory })
+        const sessionStatus = statusResponse.data?.[sessionID]
+        const isBusy = sessionStatus?.type === 'busy'
+        if (!isBusy) {
+          log('debug', 'chat.message skipped (session idle)', { sessionID, messageID })
+          return
+        }
+      } catch {
+        // If session.status fails, fall through and schedule — safer to
+        // interrupt than to silently drop a queued message.
       }
 
       schedulePending(

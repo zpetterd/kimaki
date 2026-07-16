@@ -39,14 +39,29 @@ type PendingQuestionContext = {
   questions: AskUserQuestionInput['questions']
   answers: Record<number, string[]> // questionIndex -> selected labels
   totalQuestions: number
-  answeredCount: number
   contextHash: string
+
 }
 
 // Store pending question contexts by hash.
 // TTL prevents unbounded growth if user never answers a question.
 const QUESTION_CONTEXT_TTL_MS = 10 * 60 * 1000
 export const pendingQuestionContexts = new Map<string, PendingQuestionContext>()
+
+export function areAllQuestionsAnswered({
+  totalQuestions,
+  answers,
+}: {
+  totalQuestions: number
+  answers: Record<number, string[]>
+}): boolean {
+  for (let i = 0; i < totalQuestions; i++) {
+    if (!answers[i]) {
+      return false
+    }
+  }
+  return true
+}
 
 export function findPendingQuestionContextForRequest({
   threadId,
@@ -107,7 +122,6 @@ export async function showAskUserQuestionDropdowns({
   requestId,
   input,
   silent,
-  subtaskLabel,
 }: {
   thread: ThreadChannel
   sessionId: string
@@ -116,8 +130,6 @@ export async function showAskUserQuestionDropdowns({
   input: AskUserQuestionInput
   /** Suppress notification when queue has pending items */
   silent?: boolean
-  /** Sub-agent label shown in the question header (e.g. "explore-1") */
-  subtaskLabel?: string
 }): Promise<void> {
   const existingPending = findPendingQuestionContextForRequest({
     threadId: thread.id,
@@ -140,8 +152,8 @@ export async function showAskUserQuestionDropdowns({
     questions: input.questions,
     answers: {},
     totalQuestions: input.questions.length,
-    answeredCount: 0,
     contextHash,
+
   }
 
   pendingQuestionContexts.set(contextHash, context)
@@ -164,13 +176,11 @@ export async function showAskUserQuestionDropdowns({
     // Abort the session so OpenCode isn't stuck waiting for a reply
     const client = getOpencodeClient(ctx.directory)
     if (client) {
-      await client.session
-        .abort({
-          sessionID: ctx.sessionId,
-        })
-        .catch((error) => {
-          logger.error('Failed to abort session after question expiry:', error)
-        })
+      await client.session.abort({
+        sessionID: ctx.sessionId,
+      }).catch((error) => {
+        logger.error('Failed to abort session after question expiry:', error)
+      })
     }
   }, QUESTION_CONTEXT_TTL_MS).unref()
 
@@ -193,7 +203,8 @@ export async function showAskUserQuestionDropdowns({
       },
     ]
 
-    const placeholder = options.find((x) => x.label)?.label || 'Select an option'
+    const placeholder =
+      options.find((x) => x.label)?.label || 'Select an option'
     const selectMenu = new StringSelectMenuBuilder()
       .setCustomId(`ask_question:${contextHash}:${i}`)
       .setPlaceholder(placeholder)
@@ -205,17 +216,19 @@ export async function showAskUserQuestionDropdowns({
       selectMenu.setMaxValues(options.length)
     }
 
-    const actionRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu)
+    const actionRow =
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu)
 
-    const subtaskLine = subtaskLabel ? `**From:** \`${subtaskLabel}\`\n` : ''
     await thread.send({
-      content: `${subtaskLine}**${(q.header || '').slice(0, 200)}**\n${q.question.slice(0, 1700)}`,
+      content: `**${(q.header || '').slice(0, 200)}**\n${q.question.slice(0, 1700)}`,
       components: [actionRow],
       flags: silent ? SILENT_MESSAGE_FLAGS : NOTIFY_MESSAGE_FLAGS,
     })
   }
 
-  logger.log(`Showed ${input.questions.length} question dropdown(s) for session ${sessionId}`)
+  logger.log(
+    `Showed ${input.questions.length} question dropdown(s) for session ${sessionId}`,
+  )
 }
 
 /**
@@ -262,6 +275,13 @@ export async function handleAskQuestionSelectMenu(
     return
   }
 
+  if (context.answers[questionIndex]) {
+    logger.log(
+      `Ignored duplicate answer for question ${context.requestId} index ${questionIndex}`,
+    )
+    return
+  }
+
   // Check if "other" was selected
   if (selectedValues.includes('other')) {
     // User wants to provide custom answer
@@ -275,8 +295,6 @@ export async function handleAskQuestionSelectMenu(
     })
   }
 
-  context.answeredCount++
-
   // Update this question's message: show answer and remove dropdown
   const answeredText = context.answers[questionIndex]!.join(', ')
   await interaction.editReply({
@@ -285,10 +303,13 @@ export async function handleAskQuestionSelectMenu(
   })
 
   const username = interaction.user.globalName || interaction.user.username
-  await sendThreadMessage(context.thread, `» **${username}:** ${answeredText}`)
+  await sendThreadMessage(
+    context.thread,
+    `» **${username}:** ${answeredText}`,
+  )
 
   // Check if all questions are answered
-  if (context.answeredCount >= context.totalQuestions) {
+  if (areAllQuestionsAnswered(context)) {
     // All questions answered - send result back to session
     await submitQuestionAnswers(context)
     deletePendingQuestionContextsForRequest({
@@ -302,7 +323,9 @@ export async function handleAskQuestionSelectMenu(
  * Submit all collected answers back to the OpenCode session.
  * Uses the question.reply API to provide answers to the waiting tool.
  */
-async function submitQuestionAnswers(context: PendingQuestionContext): Promise<void> {
+async function submitQuestionAnswers(
+  context: PendingQuestionContext,
+): Promise<void> {
   try {
     const client = getOpencodeClient(context.directory)
     if (!client) {
@@ -339,7 +362,7 @@ async function submitQuestionAnswers(context: PendingQuestionContext): Promise<v
 export function parseAskUserQuestionTool(part: {
   type: string
   tool?: string
-  state?: { input?: unknown }
+  state?: { input?: AskUserQuestionInput }
 }): AskUserQuestionInput | null {
   if (part.type !== 'tool') {
     return null
@@ -351,9 +374,13 @@ export function parseAskUserQuestionTool(part: {
     return null
   }
 
-  const input = part.state?.input as AskUserQuestionInput | undefined
+  const input = part.state?.input
 
-  if (!input?.questions || !Array.isArray(input.questions) || input.questions.length === 0) {
+  if (
+    !input?.questions ||
+    !Array.isArray(input.questions) ||
+    input.questions.length === 0
+  ) {
     return null
   }
 

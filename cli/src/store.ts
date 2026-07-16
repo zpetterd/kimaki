@@ -103,6 +103,20 @@ export type KimakiState = {
   // Read by: commands/permissions.ts showPermissionButtons().
   permissionTimeoutMs: number
 
+  // Whether background auto-upgrade of kimaki is enabled on startup.
+  // When true (default), kimaki checks npm for a newer version and installs
+  // it in the background. Set to false via --no-auto-upgrade CLI flag.
+  // Changes: set once at startup.
+  // Read by: cli-runner.ts run() before calling backgroundUpgradeKimaki().
+  autoUpgradeEnabled: boolean
+
+  // When true, all new sessions from channel messages create git worktrees.
+  // Set once at startup from --worktrees CLI flag. The per-channel toggle
+  // (getChannelWorktreesEnabled) is checked separately; this is the global override.
+  // Changes: set once at startup.
+  // Read by: discord-bot.ts message handler, commands/agent.ts quick-agent with prompt.
+  useWorktrees: boolean
+
   // Whether background sync of external OpenCode sessions is enabled.
   // When true (default), sessions started from the OpenCode CLI or TUI
   // are mirrored into Discord threads so they can be browsed, searched,
@@ -165,6 +179,8 @@ export const store = createStore<KimakiState>(() => ({
   allowedMentions: ['users'],
   allowAllUsers: false,
   permissionTimeoutMs: 10 * 60 * 1000,
+  useWorktrees: false,
+  autoUpgradeEnabled: true,
   syncEnabled: true,
   discordBaseUrl: 'https://discord.com',
   gatewayToken: null,

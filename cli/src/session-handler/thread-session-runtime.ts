@@ -43,7 +43,7 @@ import {
   setPartMessage,
   getThreadSession,
   setThreadSession,
-  getThreadWorktree,
+  getThreadWorktreeOrWorkspace,
   setSessionAgent,
   clearSessionModel,
   getVariantCascade,
@@ -98,6 +98,7 @@ import {
   hasAssistantMessageCompletedBefore,
   isAssistantMessageInLatestUserTurn,
   isAssistantMessageNaturalCompletion,
+  isStaleEventForSession,
   type EventBufferEvent,
   type EventBufferEntry,
 } from './event-stream-state.js'
@@ -333,23 +334,24 @@ function getTokenTotal(tokens: TokenUsage): number {
   return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 }
 
+/**
+ * Built-in read-only tools that are hidden in default verbosity mode.
+ * Any tool NOT in this list is considered "essential" and shown,
+ * which means custom tools, MCP tools, and plugin tools are visible by default.
+ */
+const HIDDEN_READONLY_TOOLS = [
+  'read',
+  'glob',
+  'grep',
+  'describe-media',
+  'todoread',
+]
+
 /** Check if a tool part is "essential" (shown in text-and-essential-tools mode). */
 export function isEssentialToolName(toolName: string): boolean {
-  const essentialTools = [
-    'edit',
-    'write',
-    'apply_patch',
-    'bash',
-    'webfetch',
-    'websearch',
-    'googlesearch',
-    'codesearch',
-    'task',
-    'todowrite',
-    'skill',
-  ]
-  // Also match any MCP tool that contains these names
-  return essentialTools.some((name) => {
+  // Hide known read-only built-in tools; show everything else
+  // (custom tools, MCP tools, plugin tools are visible by default)
+  return !HIDDEN_READONLY_TOOLS.some((name) => {
     return toolName === name || toolName.endsWith(`_${name}`)
   })
 }
@@ -524,6 +526,13 @@ export type IngressInput = {
   /** Optional guard for retries: skip enqueue when session has changed. */
   expectedSessionId?: string
   /**
+   * When true, the message is added to the session context without triggering
+   * the AI agent loop. Used for messages that should be visible to the model
+   * on the next real turn but should not cause a response on their own
+   * (e.g. user-to-user replies in a thread).
+   */
+  noReply?: boolean
+  /**
    * Lazy preprocessing callback. When set, the runtime serializes it via a
    * lightweight promise chain (preprocessChain) to resolve prompt/images/mode
    * from the raw Discord message. This replaces the threadIngressQueue in
@@ -588,6 +597,7 @@ export class ThreadSessionRuntime {
   // message and showing multiple back-to-back POSTs is wasteful.
   private typingKeepaliveTimeout: ReturnType<typeof setTimeout> | null = null
   private readonly typingRepulseDebounce: ReturnType<typeof createDebouncedTimeout>
+  private interactiveUiWatchdogTimeout: ReturnType<typeof setTimeout> | null = null
 
   private static TYPING_REPULSE_DEBOUNCE_MS = 500
 
@@ -622,8 +632,12 @@ export class ThreadSessionRuntime {
   private static EVENT_BUFFER_MAX = 1000
   private static EVENT_BUFFER_DB_FLUSH_MS = 2_000
   private static EVENT_BUFFER_TEXT_MAX_CHARS = 512
+  private static SESSION_STUCK_TIMEOUT_MS = 5 * 60 * 1_000 // 5 minutes
+  private static SESSION_STUCK_TOOL_RUNNING_TIMEOUT_MS = 30 * 60 * 1_000 // 30 minutes
+  private static INTERACTIVE_UI_STUCK_TIMEOUT_MS = 5 * 60 * 1_000 // 5 minutes
   private eventBuffer: EventBufferEntry[] = []
   private nextEventIndex = 0
+  private lastEventAppendTime = 0
   private persistEventBufferDebounced: ReturnType<typeof createDebouncedProcessFlush>
   private readonly sentPartIdsBootstrap: Promise<void>
 
@@ -801,6 +815,7 @@ export class ThreadSessionRuntime {
     this.eventBuffer = hydratedEvents.slice(-ThreadSessionRuntime.EVENT_BUFFER_MAX)
     const lastHydratedEvent = this.eventBuffer[this.eventBuffer.length - 1]
     this.nextEventIndex = lastHydratedEvent ? Number(lastHydratedEvent.eventIndex || 0) + 1 : 0
+    this.lastEventAppendTime = Date.now()
     logger.log(
       `[SESSION EVENT DB] Hydrated ${this.eventBuffer.length} events for session ${sessionId}`,
     )
@@ -935,6 +950,7 @@ export class ThreadSessionRuntime {
     // instead of waiting for the runtime object itself to become unreachable.
     this.eventBuffer = []
     this.nextEventIndex = 0
+    this.lastEventAppendTime = 0
     this.partBuffer.clear()
     this.preprocessChain = Promise.resolve()
 
@@ -1114,6 +1130,7 @@ export class ThreadSessionRuntime {
     }
 
     const timestamp = Date.now()
+    this.lastEventAppendTime = timestamp
     const eventIndex = this.nextEventIndex
     this.nextEventIndex += 1
     this.eventBuffer.push({
@@ -1277,8 +1294,8 @@ export class ThreadSessionRuntime {
 
     // Drop events that don't match current session (stale events from
     // previous sessions), unless it's a global event or a subtask session.
-    if (!isGlobalEvent && eventSessionId && eventSessionId !== sessionId) {
-      if (!this.getSubtaskInfoForSession(eventSessionId)) {
+    if (isStaleEventForSession({ isGlobalEvent, eventSessionId, sessionId })) {
+      if (!this.getSubtaskInfoForSession(eventSessionId!)) {
         return // stale event from previous session
       }
     }
@@ -1351,9 +1368,10 @@ export class ThreadSessionRuntime {
           resolve()
           return
         }
-        const result = await action().catch(
-          (e) => new OpenCodeSdkError({ operation: 'dispatchAction', cause: e }),
-        )
+        const result = await action().catch((e) => {
+          logger.error('[DISPATCH ACTION] Action failed:', e)
+          return new OpenCodeSdkError({ operation: 'dispatchAction', cause: e })
+        })
         if (result instanceof Error) {
           reject(result)
           return
@@ -1441,6 +1459,62 @@ export class ThreadSessionRuntime {
     return isSessionBusy({ events: this.eventBuffer, sessionId })
   }
 
+  private checkSessionStuckWatchdog(): boolean {
+    if (this.lastEventAppendTime === 0) {
+      return false
+    }
+    const sessionId = this.state?.sessionId
+    if (!sessionId) {
+      return false
+    }
+    if (!isSessionBusy({ events: this.eventBuffer, sessionId })) {
+      return false
+    }
+    const elapsed = Date.now() - this.lastEventAppendTime
+    const isWaitingOnTool = this.isLastBufferedEventToolRunning()
+    const timeoutMs = isWaitingOnTool
+      ? ThreadSessionRuntime.SESSION_STUCK_TOOL_RUNNING_TIMEOUT_MS
+      : ThreadSessionRuntime.SESSION_STUCK_TIMEOUT_MS
+    if (elapsed < timeoutMs) {
+      return false
+    }
+    const contextLabel = isWaitingOnTool ? ' while a tool is running' : ''
+    logger.warn(
+      `[WATCHDOG] Session stuck for ${Math.round(elapsed / 1000)}s${contextLabel} with no events. Aborting and injecting synthetic idle. sessionId=${sessionId} ${this.formatRunStateForLog()}`,
+    )
+    this.stopTyping()
+    void this.abortSessionViaApi({
+      abortId: this.nextAbortId('watchdog-stuck-session'),
+      reason: 'session stuck watchdog: no events for ' + Math.round(elapsed / 1000) + 's',
+      sessionId,
+    })
+    this.markQueueDispatchIdle(sessionId)
+    void this.tryDrainQueue({ showIndicator: true })
+    void sendThreadMessage(
+      this.thread,
+      `Session appears unresponsive (no activity for ${Math.round(elapsed / 1000 / 60)} minutes${contextLabel}). Session has been reset — your next message will start a fresh run.`,
+      { flags: NOTIFY_MESSAGE_FLAGS },
+    ).catch((e) => {
+      logger.error('[WATCHDOG] Failed to send stuck notification:', e)
+    })
+    return true
+  }
+
+  private isLastBufferedEventToolRunning(): boolean {
+    for (let i = this.eventBuffer.length - 1; i >= 0; i--) {
+      const entry = this.eventBuffer[i]
+      if (!entry) continue
+      const e = entry.event
+      if (e.type !== 'message.part.updated') continue
+      const part = e.properties.part
+      if (part.type === 'tool' && part.state?.status === 'running') {
+        return true
+      }
+      return false
+    }
+    return false
+  }
+
   private async sendTypingPulse(): Promise<void> {
     const result = await this.thread
       .sendTyping()
@@ -1467,6 +1541,9 @@ export class ThreadSessionRuntime {
       void (async () => {
         if (!this.shouldTypeNow()) {
           this.stopTyping()
+          return
+        }
+        if (this.checkSessionStuckWatchdog()) {
           return
         }
         await this.sendTypingPulse()
@@ -1508,6 +1585,58 @@ export class ThreadSessionRuntime {
       return
     }
     this.armTypingKeepalive({ delayMs: 7000 })
+  }
+
+  private startInteractiveUiWatchdog(): void {
+    this.clearInteractiveUiWatchdog()
+    this.interactiveUiWatchdogTimeout = setTimeout(() => {
+      if (this.checkInteractiveUiStuckWatchdog()) {
+        return
+      }
+      // Session recovered (permission answered), clear the timer
+      this.clearInteractiveUiWatchdog()
+    }, ThreadSessionRuntime.INTERACTIVE_UI_STUCK_TIMEOUT_MS)
+  }
+
+  private clearInteractiveUiWatchdog(): void {
+    if (!this.interactiveUiWatchdogTimeout) {
+      return
+    }
+    clearTimeout(this.interactiveUiWatchdogTimeout)
+    this.interactiveUiWatchdogTimeout = null
+  }
+
+  private checkInteractiveUiStuckWatchdog(): boolean {
+    if (!this.hasPendingInteractiveUi()) {
+      return false
+    }
+    const sessionId = this.state?.sessionId
+    if (!sessionId) {
+      return false
+    }
+    const elapsed = Date.now() - this.lastEventAppendTime
+    if (elapsed < ThreadSessionRuntime.INTERACTIVE_UI_STUCK_TIMEOUT_MS) {
+      return false
+    }
+    logger.warn(
+      `[INTERACTIVE WATCHDOG] Interactive UI stuck for ${Math.round(elapsed / 1000)}s with no response. Aborting session. sessionId=${sessionId}`,
+    )
+    this.stopTyping()
+    void this.abortSessionViaApi({
+      abortId: this.nextAbortId('interactive-ui-stuck'),
+      reason: 'interactive UI stuck: no response for ' + Math.round(elapsed / 1000) + 's',
+      sessionId,
+    })
+    this.markQueueDispatchIdle(sessionId)
+    void this.tryDrainQueue({ showIndicator: true })
+    void sendThreadMessage(
+      this.thread,
+      `Interactive UI appears unresponsive (no response for ${Math.round(elapsed / 1000 / 60)} minutes). Session has been reset — your next message will start a fresh run.`,
+      { flags: NOTIFY_MESSAGE_FLAGS },
+    ).catch((e) => {
+      logger.error('[INTERACTIVE WATCHDOG] Failed to send stuck notification:', e)
+    })
+    return true
   }
 
   private stopTyping(): void {
@@ -2179,6 +2308,7 @@ export class ThreadSessionRuntime {
       logger.log(
         `[SESSION IDLE] session became idle sessionId=${sessionId} drainQueue=${shouldDrainQueuedMessages} ${this.formatRunStateForLog()}`,
       )
+      this.clearInteractiveUiWatchdog()
       await this.persistEventBufferDebounced.flush()
 
       if (!shouldDrainQueuedMessages) {
@@ -2267,6 +2397,7 @@ export class ThreadSessionRuntime {
 
     const errorMessage = truncateSessionErrorMessage(formatSessionErrorFromProps(properties.error))
     logger.error(`Sending error to thread: ${errorMessage}`)
+    this.clearInteractiveUiWatchdog()
     await sendThreadMessage(this.thread, `✗ opencode session error: ${errorMessage}`, {
       flags: NOTIFY_MESSAGE_FLAGS,
     })
@@ -2348,6 +2479,7 @@ export class ThreadSessionRuntime {
     )
 
     this.stopTyping()
+    this.startInteractiveUiWatchdog()
 
     const { messageId, contextHash } = await showPermissionButtons({
       thread: this.thread,
@@ -2383,6 +2515,8 @@ export class ThreadSessionRuntime {
     }
 
     logger.log(`Permission ${properties.requestID} replied with: ${properties.reply}`)
+
+    this.clearInteractiveUiWatchdog()
 
     const threadPermissions = pendingPermissions.get(this.thread.id)
     if (!threadPermissions) {
@@ -2437,6 +2571,8 @@ export class ThreadSessionRuntime {
       },
     })
 
+    this.startInteractiveUiWatchdog()
+
     if (isMainSession) {
       this.maybeHandoffQueuedItemForPendingQuestion({
         sessionId,
@@ -2456,6 +2592,7 @@ export class ThreadSessionRuntime {
     }
 
     this.onInteractiveUiStateChanged()
+    this.clearInteractiveUiWatchdog()
 
     if (isMainSession) {
       // When a question is answered and the local queue has items, the model may
@@ -2758,6 +2895,18 @@ export class ThreadSessionRuntime {
         return
       }
 
+      // Context-only messages (noReply) should not create a new session.
+      // If there is no existing session, silently skip.
+      if (input.noReply) {
+        const existingSessionId = this.state?.sessionId || await getThreadSession(this.thread.id) || undefined
+        if (!existingSessionId) {
+          logger.log(
+            `[INGRESS] Skipping noReply message for thread ${this.threadId}: no existing session`,
+          )
+          return
+        }
+      }
+
       // Helper: stop typing and drain queued local messages on error.
       const cleanupOnError = async (errorMessage: string) => {
         this.stopTyping()
@@ -2925,13 +3074,13 @@ export class ThreadSessionRuntime {
       })()
 
       // ── Worktree + channel topic for per-turn prompt context ──
-      const worktreeInfo = await getThreadWorktree(this.thread.id)
+      const worktreeInfoForPrompt = await getThreadWorktreeOrWorkspace(this.thread.id)
       const worktree: WorktreeInfo | undefined =
-        worktreeInfo?.status === 'ready' && worktreeInfo.worktree_directory
+        worktreeInfoForPrompt?.status === 'ready' && worktreeInfoForPrompt.workspace_directory
           ? {
-              worktreeDirectory: worktreeInfo.worktree_directory,
-              branch: worktreeInfo.worktree_name,
-              mainRepoDirectory: worktreeInfo.project_directory,
+              worktreeDirectory: worktreeInfoForPrompt.workspace_directory,
+              branch: worktreeInfoForPrompt.workspace_name,
+              mainRepoDirectory: worktreeInfoForPrompt.project_directory,
             }
           : undefined
 
@@ -2987,6 +3136,7 @@ export class ThreadSessionRuntime {
         ...(resolvedAgent ? { agent: resolvedAgent } : {}),
         ...(modelField ? { model: modelField } : {}),
         ...variantField,
+        ...(input.noReply ? { noReply: true } : {}),
       }
       const promptResult = await getClient()
         .session.promptAsync(request)
@@ -3006,7 +3156,10 @@ export class ThreadSessionRuntime {
         `[INGRESS] promptAsync accepted by opencode queue sessionId=${session.id} threadId=${this.threadId}`,
       )
 
-      this.markQueueDispatchBusy(session.id)
+      // noReply messages don't trigger the agent loop, so don't mark as busy
+      if (!input.noReply) {
+        this.markQueueDispatchBusy(session.id)
+      }
     })
 
     if (skippedBySessionGuard) {
@@ -3155,8 +3308,15 @@ export class ThreadSessionRuntime {
         // Route with the resolved mode through normal paths.
         // Await the enqueue so session state (ensureSession, setThreadSession)
         // is persisted before the next message's preprocessing reads it.
-        const enqueueResult =
-          resolvedInput.mode === 'local-queue' || resolvedInput.command
+        // noReply messages always go through the opencode path so the flag
+        // reaches promptAsync; local queue doesn't support noReply.
+        const enqueueResult = resolvedInput.noReply
+          ? await this.submitViaOpencodeQueue({
+              ...resolvedInput,
+              mode: 'opencode',
+              command: undefined,
+            })
+          : (resolvedInput.mode === 'local-queue' || resolvedInput.command)
             ? await this.enqueueViaLocalQueue(resolvedInput)
             : await this.submitViaOpencodeQueue(resolvedInput)
         resolveOuter(enqueueResult)
@@ -3612,13 +3772,13 @@ export class ThreadSessionRuntime {
     })()
 
     // ── Worktree info for per-turn prompt context ─────────────
-    const worktreeInfo = await getThreadWorktree(this.thread.id)
+    const worktreeInfoForPrompt = await getThreadWorktreeOrWorkspace(this.thread.id)
     const worktree: WorktreeInfo | undefined =
-      worktreeInfo?.status === 'ready' && worktreeInfo.worktree_directory
+      worktreeInfoForPrompt?.status === 'ready' && worktreeInfoForPrompt.workspace_directory
         ? {
-            worktreeDirectory: worktreeInfo.worktree_directory,
-            branch: worktreeInfo.worktree_name,
-            mainRepoDirectory: worktreeInfo.project_directory,
+            worktreeDirectory: worktreeInfoForPrompt.workspace_directory,
+            branch: worktreeInfoForPrompt.workspace_name,
+            mainRepoDirectory: worktreeInfoForPrompt.project_directory,
           }
         : undefined
 
@@ -3875,27 +4035,28 @@ export class ThreadSessionRuntime {
   > {
     const directory = this.sdkDirectory
 
-    // Resolve worktree info for server initialization
-    const worktreeInfo = await getThreadWorktree(this.thread.id)
-
-    // Auto-recover missing worktree directory
-    if (worktreeInfo?.status === 'ready' && worktreeInfo.worktree_directory) {
-      const { recoverWorktreeDirectory } = await import('../worktrees.js')
-      const recovery = await recoverWorktreeDirectory({ threadId: this.thread.id })
-      if (recovery instanceof Error) {
-        logger.warn(`[WORKTREE] Worktree directory recovery error: ${recovery.message}`)
-      } else if (!recovery.recovered) {
-        logger.warn(
-          `[WORKTREE] Worktree directory recovery failed: ${recovery.reason ?? 'unknown'}`,
-        )
-      }
+    // Auto-recover missing worktree directory (handles both thread_workspaces and thread_worktrees)
+    const { recoverWorktreeDirectory: recoverDir } = await import('../worktrees.js')
+    const recovery = await recoverDir({ threadId: this.thread.id })
+    if (recovery instanceof Error) {
+      logger.warn(`[WORKTREE] Worktree directory recovery error: ${recovery.message}`)
+    } else if (!recovery.recovered) {
+      logger.warn(
+        `[WORKTREE] Worktree directory recovery failed: ${recovery.reason ?? 'unknown'}`,
+      )
     }
 
+    // Re-fetch workspace info after recovery in case it was updated
+    const workspaceInfoAfterRecovery = await getThreadWorktreeOrWorkspace(this.thread.id)
+
     const worktreeDirectory =
-      worktreeInfo?.status === 'ready' && worktreeInfo.worktree_directory
-        ? worktreeInfo.worktree_directory
+      workspaceInfoAfterRecovery?.status === 'ready' &&
+      workspaceInfoAfterRecovery.workspace_directory
+        ? workspaceInfoAfterRecovery.workspace_directory
         : undefined
-    const originalRepoDirectory = worktreeDirectory ? worktreeInfo?.project_directory : undefined
+    const originalRepoDirectory = worktreeDirectory
+      ? workspaceInfoAfterRecovery?.project_directory
+      : undefined
 
     const getClientResult = await initializeOpencodeForDirectory(directory, {
       originalRepoDirectory,
