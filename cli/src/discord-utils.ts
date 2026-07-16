@@ -232,6 +232,7 @@ export async function archiveThread({
       await client.session.update({
         sessionID: sessionId,
         title: newTitle,
+        time: { archived: Date.now() },
       })
     })().catch((e) => new Error('Failed to update session title', { cause: e }))
     if (updateResult instanceof Error) {
