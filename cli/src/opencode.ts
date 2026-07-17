@@ -597,9 +597,12 @@ async function startSingleServer({
 } = {}): Promise<ServerStartError | SingleServer> {
   const externalUrl = store.getState().opencodeServerUrl
   if (externalUrl) {
-    opencodeLogger.warn(
-      `External OpenCode server specified (${externalUrl}) but workspace support requires local server - using local server`,
-    )
+    opencodeLogger.log(`Using external OpenCode server: ${externalUrl}`)
+    return {
+      port: 0,
+      process: { pid: 0, kill: () => true } as ChildProcess,
+      baseUrl: externalUrl,
+    }
   }
 
   ensureProcessCleanupHandlersRegistered()
