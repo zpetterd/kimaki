@@ -22,8 +22,18 @@ function isAbortError(err: unknown): boolean {
   return false
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const timeout = setTimeout(resolve, ms)
+    signal.addEventListener('abort', () => {
+      clearTimeout(timeout)
+      resolve()
+    }, { once: true })
+  })
 }
 
 const STALE_TIMEOUT_MS = 120_000
@@ -39,9 +49,9 @@ const callbacks = new Map<string, EventCallback>()
 let loopRunning = false
 let disposed = false
 let controller: AbortController | null = null
-let sseConnected = false
-
 const SSE_CONNECTION_TIMEOUT_MS = 10_000
+let connected = false
+const connectionWaiters = new Set<() => void>()
 
 // ── Public API ─────────────────────────────────────────────────
 
@@ -73,7 +83,7 @@ export function unregisterEventListener(threadId: string): void {
 export function disposeGlobalEventListener(): void {
   disposed = true
   loopRunning = false
-  sseConnected = false
+  connected = false
   controller?.abort()
   controller = null
   callbacks.clear()
@@ -85,43 +95,80 @@ export function disposeGlobalEventListener(): void {
  */
 export function restartGlobalEventListener(): void {
   if (disposed) return
+  connected = false
   controller?.abort()
 }
 
 /**
- * Wait for the global SSE event stream to be connected.
- * Returns true if connected, false if timeout elapsed without connection.
+ * Wait until the event stream is connected.
+ * Returns a Promise<void> with an optional timeout. Resolves on connection,
+ * rejects with `Timed out waiting for global event listener` if the timeout
+ * elapses, or rejects with `Aborted while waiting for global event listener`
+ * if the listener is disposed. Always starts the listener so callers without
+ * registered runtimes (e.g. worktree creation before a ThreadSessionRuntime
+ * is constructed) still establish the SSE connection.
  */
-export async function waitForSseConnection(timeoutMs = SSE_CONNECTION_TIMEOUT_MS): Promise<boolean> {
-  if (sseConnected) return true
-
-  logger.log('[GLOBAL LISTENER] waitForSseConnection: SSE not connected, waiting...')
-  const startTime = Date.now()
-  while (!sseConnected && !disposed) {
-    if (Date.now() - startTime > timeoutMs) {
-      logger.warn(`[GLOBAL LISTENER] waitForSseConnection: timed out after ${timeoutMs}ms`)
-      return false
+export function waitForSseConnection(
+  timeoutMs = SSE_CONNECTION_TIMEOUT_MS,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (disposed) {
+      reject(new Error('Aborted while waiting for global event listener'))
+      return
     }
-    await delay(100)
-  }
-  logger.log('[GLOBAL LISTENER] waitForSseConnection: SSE connected')
-  return sseConnected
+    if (connected) {
+      resolve()
+      return
+    }
+    ensureListenerRunning()
+
+    let settled = false
+    const onConnect = () => {
+      if (settled) return
+      settled = true
+      connectionWaiters.delete(onConnect)
+      clearTimeout(timeoutHandle)
+      resolve()
+    }
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return
+      settled = true
+      connectionWaiters.delete(onConnect)
+      reject(new Error('Timed out waiting for global event listener'))
+    }, timeoutMs)
+    connectionWaiters.add(onConnect)
+  })
 }
 
 /**
  * Ensure the global event listener is running and the SSE stream is connected.
  * This should be called before making SDK calls that depend on global events
  * (like workspace.create) to avoid race conditions where the event subscription
- * hasn't been established yet.
+ * hasn't been established yet. Errors are logged but never thrown — callers
+ * either retry or fall through to the next recovery step.
  */
-export async function ensureSseConnection(timeoutMs = SSE_CONNECTION_TIMEOUT_MS): Promise<void> {
+export async function ensureSseConnection(
+  timeoutMs = SSE_CONNECTION_TIMEOUT_MS,
+): Promise<void> {
   ensureListenerRunning()
-  const connected = await waitForSseConnection(timeoutMs)
-  if (connected) {
+  try {
+    await waitForSseConnection(timeoutMs)
     logger.log('[GLOBAL LISTENER] ensureSseConnection: SSE ready')
-  } else {
-    logger.warn('[GLOBAL LISTENER] ensureSseConnection: timed out waiting for SSE')
+  } catch (error) {
+    logger.warn(
+      '[GLOBAL LISTENER] ensureSseConnection: failed to wait for SSE:',
+      error instanceof Error ? error.message : String(error),
+    )
   }
+}
+
+/** Wait until the event stream is connected before starting event-producing work. */
+export function waitForGlobalEventListener(): Promise<void> {
+  if (callbacks.size === 0 || connected) return Promise.resolve()
+  ensureListenerRunning()
+  return new Promise((resolve) => {
+    connectionWaiters.add(resolve)
+  })
 }
 
 // ── Internals ──────────────────────────────────────────────────
@@ -193,12 +240,14 @@ async function runEventLoop(): Promise<void> {
     if (!baseUrl) {
       if (callbacks.size === 0) {
         logger.log('[GLOBAL LISTENER] No registrations, pausing')
-        sseConnected = false
+        connected = false
         loopRunning = false
         return
       }
-      logger.warn(`[GLOBAL LISTENER] No OpenCode server available, retrying in ${backoffMs}ms`)
-      await delay(backoffMs)
+      logger.warn(
+        `[GLOBAL LISTENER] No OpenCode server available, retrying in ${backoffMs}ms`,
+      )
+      await delay(backoffMs, signal)
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
       continue
     }
@@ -212,7 +261,7 @@ async function runEventLoop(): Promise<void> {
     if (subscribeResult instanceof Error) {
       if (isAbortError(subscribeResult)) {
         if (disposed) {
-          sseConnected = false
+          connected = false
           return
         }
         backoffMs = 500
@@ -222,14 +271,16 @@ async function runEventLoop(): Promise<void> {
         `[GLOBAL LISTENER] Subscribe failed, retrying in ${backoffMs}ms:`,
         subscribeResult.message,
       )
-      await delay(backoffMs)
+      await delay(backoffMs, signal)
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
       continue
     }
 
     const events = subscribeResult.stream
 
-    sseConnected = true
+    connected = true
+    for (const resolve of connectionWaiters) resolve()
+    connectionWaiters.clear()
     logger.log('[GLOBAL LISTENER] Connected to global event stream')
 
     let receivedAnyEvent = false
@@ -255,7 +306,7 @@ async function runEventLoop(): Promise<void> {
     })().catch((e) => new OpenCodeSdkError({ operation: 'event.iterate', cause: e }))
 
     clearInterval(staleCheck)
-    sseConnected = false
+    connected = false
 
     if (receivedAnyEvent) {
       backoffMs = 500
@@ -271,11 +322,17 @@ async function runEventLoop(): Promise<void> {
         `[GLOBAL LISTENER] Stream broke, reconnecting in ${backoffMs}ms:`,
         iterResult.message,
       )
-      await delay(backoffMs)
+      await delay(backoffMs, signal)
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
     } else {
-      logger.log(`[GLOBAL LISTENER] Stream ended normally, reconnecting in ${backoffMs}ms`)
-      await delay(backoffMs)
+      if (signal.aborted) {
+        backoffMs = 500
+        continue
+      }
+      logger.log(
+        `[GLOBAL LISTENER] Stream ended normally, reconnecting in ${backoffMs}ms`,
+      )
+      await delay(backoffMs, signal)
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
     }
   }

@@ -31,7 +31,11 @@ import {
   extractSdkErrorMessage,
 } from '../opencode.js'
 import { isAbortError } from '../utils.js'
-import { registerEventListener, unregisterEventListener } from './global-event-listener.js'
+import {
+  registerEventListener,
+  unregisterEventListener,
+  waitForGlobalEventListener,
+} from './global-event-listener.js'
 import { createLogger, LogPrefix } from '../logger.js'
 import { sendThreadMessage, SILENT_MESSAGE_FLAGS, NOTIFY_MESSAGE_FLAGS } from '../discord-utils.js'
 import type { DiscordFileAttachment } from '../message-formatting.js'
@@ -2353,6 +2357,25 @@ export class ThreadSessionRuntime {
       repulseTyping: false,
     })
 
+    // Skip footer if model produced no visible output (no text, no tool calls,
+    // just step-start/step-finish lifecycle parts). This happens when the model
+    // decides not to respond.
+    const hasVisibleOutput = assistantMessageIds.some((msgId) => {
+      const parts = this.getBufferedParts(msgId)
+      return parts.some(
+        (part) => part.type !== 'step-start' && part.type !== 'step-finish',
+      )
+    })
+    if (!hasVisibleOutput) {
+      this.stopTyping()
+      this.resetPerRunState()
+      this.clearBufferedPartsForMessages(assistantMessageIds)
+      logger.log(
+        `[ASSISTANT COMPLETED] no visible output, skipping footer for message ${completedMessageId} sessionId=${sessionId}`,
+      )
+      return
+    }
+
     this.stopTyping()
 
     const turnStartTime = getCurrentTurnStartTime({
@@ -3147,8 +3170,8 @@ export class ThreadSessionRuntime {
         ...variantField,
         ...(input.noReply ? { noReply: true } : {}),
       }
-      const promptResult = await getClient()
-        .session.promptAsync(request)
+      await waitForGlobalEventListener()
+      const promptResult = await getClient().session.promptAsync(request)
         .catch((e) => new OpenCodeSdkError({ operation: 'session.promptAsync', cause: e }))
       if (promptResult instanceof Error || promptResult.error) {
         const errorMessage =
@@ -3521,9 +3544,9 @@ export class ThreadSessionRuntime {
     return this.getQueueLength() > 0 ? SILENT_MESSAGE_FLAGS : NOTIFY_MESSAGE_FLAGS
   }
 
-  /** Clear all queued messages. */
-  clearQueue(): void {
-    threadState.clearQueueItems(this.threadId)
+  /** Clear all queued messages. Returns the removed items. */
+  clearQueue(): threadState.QueuedMessage[] {
+    return threadState.clearQueueItems(this.threadId)
   }
 
   /** Remove a queued message by its 1-based position. */
@@ -3987,6 +4010,7 @@ export class ThreadSessionRuntime {
       return
     }
 
+    await waitForGlobalEventListener()
     const promptResponse = await getClient().session.promptAsync({
       sessionID: session.id,
       directory: this.sdkDirectory,

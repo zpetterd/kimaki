@@ -18,6 +18,7 @@ import {
   setWorkspaceError,
   getChannelDirectory,
   getThreadSession,
+  getThreadWorktreeOrWorkspace,
   setThreadSession,
 } from '../database.js'
 import {
@@ -246,21 +247,33 @@ async function tryWorkspaceCreate({
       return new Error(`Workspace creation failed: ${JSON.stringify(response.error)}`)
     }
     const workspace = response.data
-    if (!workspace?.directory) {
-      return new Error('Workspace SDK returned no directory')
+    if (!workspace?.directory || !workspace.id) {
+      return new Error('Workspace SDK returned no directory or ID')
     }
     return { directory: workspace.directory, workspaceId: workspace.id }
   }
 
-  const result = await doCreate()
-  if (result instanceof Error && result.message.includes('Timed out waiting for global event')) {
+  let result: { directory: string; workspaceId?: string } | Error = await doCreate()
+  if (
+    result instanceof Error &&
+    /Timed out waiting for global event/.test(result.message)
+  ) {
     logger.warn('[WORKTREE] workspace.create timed out, retrying after SSE reconnect')
-    const { restartGlobalEventListener, waitForSseConnection } = await import('../session-handler/global-event-listener.js')
+    const { restartGlobalEventListener, waitForSseConnection } = await import(
+      '../session-handler/global-event-listener.js'
+    )
     restartGlobalEventListener()
-    await waitForSseConnection()
-    return doCreate()
+    await waitForSseConnection().catch(() => {
+      // Fall through and retry doCreate anyway; the second attempt may succeed
+      // once the SSE stream has had a moment to reconnect.
+    })
+    result = await doCreate()
   }
-  if (result instanceof Error && result.message.includes('a branch named') && result.message.includes('already exists')) {
+  if (
+    result instanceof Error &&
+    result.message.includes('a branch named') &&
+    result.message.includes('already exists')
+  ) {
     // Recover from a previous timed-out run: git already created the branch and
     // the worktree dir, but the opencode SDK never recorded the workspace. Reuse
     // the existing worktree directory instead of creating a new one.
@@ -646,6 +659,15 @@ async function handleWorktreeInThread({
         return
       }
 
+      const workspace = await getThreadWorktreeOrWorkspace(worktreeThread.id)
+      if (!workspace?.workspace_id) {
+        await sendThreadMessage(
+          worktreeThread,
+          '✗ Worktree is ready, but OpenCode returned no workspace ID for context reuse.',
+        )
+        return
+      }
+
       const getClient = await initializeOpencodeForDirectory(result, {
         originalRepoDirectory: projectDirectory,
         channelId: parent.id,
@@ -661,6 +683,7 @@ async function handleWorktreeInThread({
       const forkResponse = await getClient().session.fork({
         sessionID: sourceSessionId,
         directory: result,
+        workspace: workspace.workspace_id,
       }).catch((e) => new OpenCodeSdkError({ operation: 'session.fork', cause: e }))
       if (forkResponse instanceof Error) {
         logger.error('[NEW-WORKTREE] Failed to fork session into worktree:', forkResponse)

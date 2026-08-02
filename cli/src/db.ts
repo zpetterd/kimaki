@@ -160,6 +160,7 @@ async function migrateSchema({
     'ALTER TABLE thread_sessions ADD COLUMN last_synced_name TEXT',
     'ALTER TABLE thread_sessions ADD COLUMN parent_session_id TEXT',
     'ALTER TABLE thread_sessions ADD COLUMN cleanup_prompted_at DATETIME',
+    'ALTER TABLE channel_directories ADD COLUMN guild_id TEXT',
   ]
   for (const stmt of alterStatements) {
     await client.execute(stmt).catch(() => undefined)
