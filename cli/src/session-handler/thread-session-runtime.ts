@@ -592,7 +592,7 @@ function getWorktreePromptKey(worktree: WorktreeInfo | undefined): string | null
 export class ThreadSessionRuntime {
   readonly threadId: string
   readonly projectDirectory: string
-  readonly sdkDirectory: string
+  sdkDirectory: string
   readonly channelId: string | undefined
   readonly appId: string | undefined
   readonly thread: ThreadChannel
@@ -4117,8 +4117,6 @@ export class ThreadSessionRuntime {
         createdNewSession: boolean
       }
   > {
-    const directory = this.sdkDirectory
-
     // Auto-recover missing worktree directory (handles both thread_workspaces and thread_worktrees)
     const { recoverWorktreeDirectory: recoverDir } = await import('../worktrees.js')
     const recovery = await recoverDir({ threadId: this.thread.id })
@@ -4141,6 +4139,15 @@ export class ThreadSessionRuntime {
     const originalRepoDirectory = worktreeDirectory
       ? workspaceInfoAfterRecovery?.project_directory
       : undefined
+
+    // Use recovered worktree path if available, otherwise fall back to sdkDirectory
+    const directory = worktreeDirectory || this.sdkDirectory
+    if (worktreeDirectory && worktreeDirectory !== this.sdkDirectory) {
+      logger.log(
+        `[WORKTREE] Updated sdkDirectory after recovery: ${this.sdkDirectory} -> ${worktreeDirectory}`,
+      )
+      this.sdkDirectory = worktreeDirectory
+    }
 
     const getClientResult = await initializeOpencodeForDirectory(directory, {
       originalRepoDirectory,

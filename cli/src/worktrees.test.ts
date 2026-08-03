@@ -2,7 +2,9 @@
 // Uses temporary local git repositories to validate submodule behavior end to end.
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { describe, expect, test } from 'vitest'
 import {
   buildSubmoduleReferencePlan,
@@ -12,6 +14,7 @@ import {
   mergeWorktree,
   parseGitmodulesFileContent,
   parseGitWorktreeListPorcelain,
+  recoverWorktreeDirectory,
   recoverWorktreeFromInfo,
   resolveSessionWorkingDirectory,
 } from './worktrees.js'
@@ -24,6 +27,8 @@ import {
   shortenWorktreeSlug,
 } from './commands/new-worktree.js'
 import { setDataDir } from './config.js'
+import { getDb } from './db.js'
+import * as schema from './schema.js'
 
 const GIT_TIMEOUT_MS = 60_000
 
@@ -911,6 +916,91 @@ describe('createWorktreeCore branch collision handling', () => {
         args: ['rev-parse', '--verify', 'refs/heads/opencode/kimaki-collision'],
       })
       expect(originalSurvives).toBeTruthy()
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('recoverWorktreeDirectory migrates old-format worktrees', () => {
+  test('migrates worktree from old path format to new managed path', { timeout: 60000 }, async () => {
+    const sandbox = createTestRoot()
+    try {
+      // Init a git repo as the "project"
+      await git({ cwd: sandbox, args: ['init', '-b', 'main'] })
+      await git({ cwd: sandbox, args: ['config', 'user.email', 'test@test.com'] })
+      await git({ cwd: sandbox, args: ['config', 'user.name', 'Test'] })
+      fs.writeFileSync(path.join(sandbox, 'readme.md'), 'project')
+      await git({ cwd: sandbox, args: ['add', '.'] })
+      await git({ cwd: sandbox, args: ['commit', '-m', 'init'] })
+
+      // Create a branch for the worktree
+      await git({ cwd: sandbox, args: ['checkout', '-b', 'opencode/kimaki-migration-test'] })
+      await git({ cwd: sandbox, args: ['checkout', 'main'] })
+
+      // Simulate the opencode SDK creating worktree at old-format path
+      const projectHash = crypto.createHash('sha1').update(sandbox).digest('hex').slice(0, 40)
+      const oldWorktreeDir = path.join(
+        os.homedir(),
+        '.local',
+        'share',
+        'opencode',
+        'worktree',
+        projectHash,
+        'random-slug',
+      )
+      fs.mkdirSync(path.dirname(oldWorktreeDir), { recursive: true })
+      await git({
+        cwd: sandbox,
+        args: ['worktree', 'add', oldWorktreeDir, 'opencode/kimaki-migration-test'],
+      })
+
+      // Verify old worktree exists
+      expect(fs.existsSync(oldWorktreeDir)).toBe(true)
+
+      // Simulate the DB having the old path
+      const { setWorkspaceReady, getThreadWorkspace } = await import('./database.js')
+      const testThreadId = 'test-thread-migration-' + Date.now()
+
+      // Directly insert the workspace row with old path
+      const db = await getDb()
+
+      // Insert thread_sessions first (required by foreign key)
+      await db.insert(schema.thread_sessions).values({
+        thread_id: testThreadId,
+        session_id: '',
+      }).onConflictDoNothing()
+
+      await db.insert(schema.thread_workspaces).values({
+        thread_id: testThreadId,
+        workspace_type: 'auto',
+        workspace_name: 'random-slug',
+        project_directory: sandbox,
+        workspace_id: 'ws-test-id',
+        workspace_directory: oldWorktreeDir,
+        status: 'ready',
+      })
+
+      const result = await recoverWorktreeDirectory({ threadId: testThreadId })
+
+      // Recovery should have migrated the worktree
+      if (result instanceof Error) {
+        throw result
+      }
+      expect(result.recovered).toBe(true)
+      expect(result.reason).toBe('migrated')
+
+      // New directory should exist and be different from old path
+      expect(result.worktreeDirectory).not.toBe(oldWorktreeDir)
+      expect(fs.existsSync(result.worktreeDirectory!)).toBe(true)
+
+      // Old directory should NOT exist anymore as a real directory (it's now a symlink to new location)
+      const oldPathStats = fs.lstatSync(oldWorktreeDir)
+      expect(oldPathStats.isSymbolicLink()).toBe(true)
+
+      // DB should be updated with new path
+      const updatedWorkspace = await getThreadWorkspace(testThreadId)
+      expect(updatedWorkspace?.workspace_directory).toBe(result.worktreeDirectory)
     } finally {
       fs.rmSync(sandbox, { recursive: true, force: true })
     }
