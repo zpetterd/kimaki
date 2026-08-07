@@ -143,6 +143,7 @@ import dedent from 'string-dedent'
 import { createLogger, formatErrorWithStack, LogPrefix } from './logger.js'
 import { writeHeapSnapshot, startHeapMonitor } from './heap-monitor.js'
 import { startTaskRunner } from './task-runner.js'
+import { startThreadCleanupSweeper } from './thread-cleanup-sweeper.js'
 // Increase connection pool to prevent deadlock when multiple sessions have open SSE streams.
 // Each session's event.subscribe() holds a connection; without enough connections,
 // regular HTTP requests (question.reply, session.prompt) get blocked → deadlock.
@@ -1505,6 +1506,7 @@ export async function startDiscordBot({
   startHeapMonitor()
   const stopTaskRunner = startTaskRunner({ token })
   const stopRuntimeIdleSweeper = startRuntimeIdleSweeper()
+  const stopThreadCleanupSweeper = startThreadCleanupSweeper({ discordClient })
 
   // Prevent discord.js from permanently killing the REST token on 401.
   // @discordjs/rest calls setToken(null) whenever it receives a 401 response.
@@ -1533,6 +1535,7 @@ export async function startDiscordBot({
     try {
       await stopRuntimeIdleSweeper()
       await stopTaskRunner()
+      await stopThreadCleanupSweeper()
 
       await flushDebouncedProcessCallbacks().catch((error) => {
         discordLogger.warn(
