@@ -32,6 +32,7 @@ import {
 import { git, isDirty, getDefaultBranch, deleteWorktree } from './worktrees.js'
 import { registerHtmlAction, pendingHtmlActions } from './html-actions.js'
 import { createLogger, formatErrorWithStack } from './logger.js'
+import { archiveOpenCodeSessionForThread } from './discord-utils.js'
 
 const cleanupLogger = createLogger('CLEANUP')
 
@@ -229,6 +230,17 @@ async function evaluateWorktreeThread({
         await rest.patch(Routes.channel(threadId), {
           body: { archived: true },
         })
+        const ocResult = await archiveOpenCodeSessionForThread({
+          threadId,
+          projectDirectory: projectDir,
+          workingDirectory: worktreeDir,
+        })
+        if (ocResult instanceof Error) {
+          cleanupLogger.warn(
+            `Failed to archive OpenCode session for thread ${threadId}:`,
+            formatErrorWithStack(ocResult),
+          )
+        }
         await interaction.editReply({
           content: 'Worktree cleaned up and thread archived.',
           components: [],
@@ -340,6 +352,13 @@ async function evaluateNormalThread({
         await rest.patch(Routes.channel(threadId), {
           body: { archived: true },
         })
+        const ocResult = await archiveOpenCodeSessionForThread({ threadId })
+        if (ocResult instanceof Error) {
+          cleanupLogger.warn(
+            `Failed to archive OpenCode session for thread ${threadId}:`,
+            formatErrorWithStack(ocResult),
+          )
+        }
         await setCleanupPromptedAt(threadId, NEVER_REPROMPT_AT).catch(() => undefined)
         await interaction.editReply({
           content: 'Thread archived.',
