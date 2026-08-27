@@ -17,12 +17,13 @@ import type {
   ThreadChannel,
 } from 'discord.js'
 const { ChannelType, GuildMember, MessageFlags, PermissionsBitField, REST, Routes } = discord
-import type { OpencodeClient } from '@opencode-ai/sdk/v2'
+import type { OpencodeClient, Session } from '@opencode-ai/sdk/v2'
 import { discordApiUrl } from './discord-urls.js'
 import { Lexer } from 'marked'
 import { splitTablesFromMarkdown } from './format-tables.js'
-import { getChannelDirectory, getThreadWorktreeOrWorkspace } from './database.js'
+import { getChannelDirectory, getThreadSession, getThreadWorktreeOrWorkspace } from './database.js'
 import { DiscordOperationError } from './errors.js'
+import { getOpencodeClient, initializeOpencodeForDirectory } from './opencode.js'
 import { limitHeadingDepth } from './limit-heading-depth.js'
 import { unnestCodeBlocksFromLists } from './unnest-code-blocks.js'
 import { createLogger, LogPrefix } from './logger.js'
@@ -212,6 +213,121 @@ export async function reactToThread({
   }
 }
 
+/**
+ * Mark an OpenCode session as archived and abort it.
+ * Returns null on success or an Error on failure. Callers (the slash command,
+ * the cleanup sweeper, etc.) handle the error so the Discord-side archive can
+ * still proceed and the user can be told what went wrong.
+ *
+ * This is the exact behavior the existing archiveThread helper has been
+ * quietly doing for the CLI `session archive` path — it is now first-class
+ * so the slash command and the cleanup sweeper can reuse it.
+ */
+export async function archiveOpenCodeSession({
+  client,
+  sessionId,
+  workingDirectory,
+}: {
+  client: OpencodeClient
+  sessionId: string
+  workingDirectory?: string
+}): Promise<Error | null> {
+  try {
+    const sessionResponse = await client.session.get({ sessionID: sessionId })
+    if (!sessionResponse.data) {
+      return new Error(`Session ${sessionId} not found`)
+    }
+    const currentTitle = sessionResponse.data.title || ''
+    const newTitle = currentTitle.startsWith('📁')
+      ? currentTitle
+      : `📁 ${currentTitle}`.trim()
+
+    const MAX_VERIFY_ATTEMPTS = 2
+    const VERIFY_RETRY_DELAY_MS = 250
+    const archivedAt = Date.now()
+    let updateError: Error | null = null
+
+    for (let attempt = 1; attempt <= MAX_VERIFY_ATTEMPTS; attempt += 1) {
+      await client.session.update({
+        sessionID: sessionId,
+        title: newTitle,
+        time: { archived: archivedAt },
+      })
+      const refreshed = await client.session.get({ sessionID: sessionId }) as unknown as { data: { data: Session } }
+      if (typeof refreshed.data.data?.time?.archived === 'number') {
+        updateError = null
+        break
+      }
+      updateError = new Error(`time.archived not persisted for ${sessionId}`)
+      if (attempt < MAX_VERIFY_ATTEMPTS) {
+        await new Promise<void>((r) => setTimeout(r, VERIFY_RETRY_DELAY_MS))
+      }
+    }
+
+    if (updateError) return updateError
+
+    await client.session.abort({
+      sessionID: sessionId,
+      ...(workingDirectory ? { directory: workingDirectory } : {}),
+    })
+    return null
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error))
+  }
+}
+
+/**
+ * Resolve the OpenCode session, project directory, and client for a Discord
+ * thread, then archive the session. Returns null when the thread has no
+ * attached session, when no project directory can be resolved, or when the
+ * archive itself succeeds. Returns an Error only when the OpenCode API call
+ * failed — callers log this and continue so the Discord archive is not blocked.
+ */
+export async function archiveOpenCodeSessionForThread({
+  threadId,
+  projectDirectory,
+  workingDirectory,
+}: {
+  threadId: string
+  projectDirectory?: string
+  workingDirectory?: string
+}): Promise<Error | null> {
+  const sessionId = await getThreadSession(threadId)
+  if (!sessionId) {
+    return null
+  }
+
+  let resolvedProject = projectDirectory
+  let resolvedWorking = workingDirectory
+  if (!resolvedProject) {
+    const workspace = await getThreadWorktreeOrWorkspace(threadId)
+    if (workspace?.project_directory) {
+      resolvedProject = workspace.project_directory
+      if (workspace.status === 'ready' && workspace.workspace_directory) {
+        resolvedWorking = workspace.workspace_directory
+      }
+    }
+  }
+  if (!resolvedProject) {
+    return null
+  }
+  resolvedWorking = resolvedWorking ?? resolvedProject
+
+  const serverResult = await initializeOpencodeForDirectory(resolvedProject)
+  if (serverResult instanceof Error) {
+    return serverResult
+  }
+  const client = getOpencodeClient(resolvedWorking)
+  if (!client) {
+    return null
+  }
+  return await archiveOpenCodeSession({
+    client,
+    sessionId,
+    workingDirectory: resolvedWorking,
+  })
+}
+
 export async function archiveThread({
   rest,
   threadId,
@@ -237,34 +353,13 @@ export async function archiveThread({
   })
 
   if (client && sessionId) {
-    const updateResult = await (async () => {
-      const sessionResponse = await client.session.get({
-        sessionID: sessionId,
-      })
-      if (!sessionResponse.data) {
-        return
-      }
-      const currentTitle = sessionResponse.data.title || ''
-      const newTitle = currentTitle.startsWith('📁')
-        ? currentTitle
-        : `📁 ${currentTitle}`.trim()
-      await client.session.update({
-        sessionID: sessionId,
-        title: newTitle,
-        time: { archived: Date.now() },
-      })
-    })().catch((e) => new Error('Failed to update session title', { cause: e }))
-    if (updateResult instanceof Error) {
-      discordLogger.warn(`[archive-thread] ${updateResult.message}`)
-    }
-
-    const abortResult = await client.session.abort({
-        sessionID: sessionId,
-        ...(workingDirectory ? { directory: workingDirectory } : {}),
-      })
-      .catch((e) => new Error('Failed to abort session', { cause: e }))
-    if (abortResult instanceof Error) {
-      discordLogger.warn(`[archive-thread] ${abortResult.message}`)
+    const result = await archiveOpenCodeSession({
+      client,
+      sessionId,
+      workingDirectory,
+    })
+    if (result instanceof Error) {
+      discordLogger.warn(`[archive-thread] ${result.message}`)
     }
   }
 
