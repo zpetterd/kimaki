@@ -82,6 +82,8 @@ function formatSourceLabel(info: CurrentModelInfo): string {
     case 'opencode-recent':
     case 'opencode-provider-default':
       return 'opencode default'
+    case 'invalid':
+      return 'unavailable'
     case 'none':
       return 'none'
   }
@@ -158,26 +160,36 @@ export async function handleModelVariantCommand({
     })
   }
 
-  const [currentModelInfo, cascadeVariant, providersResponse] =
-    await Promise.all([
+  const providersResponse = await getClient().provider.list({
+      directory: projectDirectory,
+    })
+  const [currentModelInfo, cascadeVariant] = await Promise.all([
       getCurrentModelInfo({
         sessionId,
         channelId: targetChannelId,
         appId,
         getClient,
         directory: projectDirectory,
+        connected: providersResponse.data?.connected,
+        providers: providersResponse.data?.all,
       }),
       getVariantCascade({
         sessionId,
         channelId: targetChannelId,
         appId,
       }),
-      getClient().provider.list({ directory: projectDirectory }),
     ])
 
   if (currentModelInfo.type === 'none') {
     await interaction.editReply({
       content: 'No model configured. Use `/model` to set one first.',
+    })
+    return
+  }
+
+  if (currentModelInfo.type === 'invalid') {
+    await interaction.editReply({
+      content: `Stored model \`${currentModelInfo.model}\` is no longer available. Run \`/model\` to pick a different one.`,
     })
     return
   }

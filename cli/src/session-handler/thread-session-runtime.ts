@@ -52,6 +52,7 @@ import {
   getThreadWorktreeOrWorkspace,
   setSessionAgent,
   clearSessionModel,
+  clearChannelModel,
   getVariantCascade,
   setSessionStartSource,
   appendSessionEventsSinceLastTimestamp,
@@ -78,6 +79,7 @@ import {
 } from '../commands/action-buttons.js'
 import { pendingFileUploadContexts, cancelPendingFileUpload } from '../commands/file-upload.js'
 import { getCurrentModelInfo, ensureSessionPreferencesSnapshot } from '../commands/model.js'
+import { isModelValid } from './model-utils.js'
 import {
   getOpencodePromptContext,
   getOpencodeSystemMessage,
@@ -3015,8 +3017,20 @@ export class ThreadSessionRuntime {
       const resolvedAgent = agentResult.agentPreference
       const availableAgents = agentResult.agents
 
+      // Fetch the live provider list once so getCurrentModelInfo can validate
+      // stored preferences against it. Catches stale rows (e.g. `deepseek/...`
+      // stored from when the provider was active) so we never dispatch a dead
+      // model id to opencode.
+      const validationProvidersResponse = await getClient()
+        .provider.list({ directory: this.sdkDirectory })
+        .catch((e) => new OpenCodeSdkError({ operation: 'provider.list', cause: e }))
+
       const [modelResult, preferredVariant] = await Promise.all([
-        (async () => {
+        (async (): Promise<
+          | { providerID: string; modelID: string }
+          | { invalid: { model: string; providerID: string; modelID: string } }
+          | undefined
+        > => {
           if (input.model) {
             const [providerID, ...modelParts] = input.model.split('/')
             const modelID = modelParts.join('/')
@@ -3031,9 +3045,26 @@ export class ThreadSessionRuntime {
             agentPreference: resolvedAgent,
             getClient,
             directory: this.sdkDirectory,
+            connected:
+                validationProvidersResponse instanceof Error
+                  ? undefined
+                  : validationProvidersResponse.data?.connected,
+            providers:
+                validationProvidersResponse instanceof Error
+                  ? undefined
+                  : validationProvidersResponse.data?.all,
           })
           if (modelInfo.type === 'none') {
             return undefined
+          }
+          if (modelInfo.type === 'invalid') {
+            return {
+              invalid: {
+                model: modelInfo.model,
+                providerID: modelInfo.providerID,
+                modelID: modelInfo.modelID,
+              },
+            }
           }
           return { providerID: modelInfo.providerID, modelID: modelInfo.modelID }
         })().catch((e) => new OpenCodeSdkError({ operation: 'resolveModelPreference', cause: e })),
@@ -3045,6 +3076,23 @@ export class ThreadSessionRuntime {
       ])
       if (modelResult instanceof Error) {
         await cleanupOnError(`Failed to resolve model: ${modelResult.message}`)
+        return
+      }
+      if (modelResult && 'invalid' in modelResult) {
+        const invalid = modelResult.invalid
+        // Clean up whichever stale preference produced the invalid result so
+        // the next dispatch can re-bootstrap from a fresh opencode default.
+        if (invalid) {
+          await clearSessionModel(session.id).catch(() => undefined)
+          if (channelId) {
+            await clearChannelModel(channelId).catch(() => undefined)
+          }
+          // No appId in this scope without resolvedAppId, but invalid result is
+          // session-scoped in practice because session preference wins first.
+        }
+        await cleanupOnError(
+          `Model \`${invalid?.model ?? 'unknown'}\` is no longer available. Run \`/model\` to pick a different one.`,
+        )
         return
       }
       const modelField = modelResult
@@ -3149,6 +3197,30 @@ export class ThreadSessionRuntime {
         { type: 'text' as const, text: syntheticContext, synthetic: true },
         ...images,
       ]
+
+      // Final backstop: validate modelField against the live provider list one
+      // more time before promptAsync. Covers the case where input.model was set
+      // by a CLI override and bypassed getCurrentModelInfo validation, or where
+      // the model became invalid between the initial provider.list and now.
+      if (
+        modelField &&
+        validationProvidersResponse &&
+        !(validationProvidersResponse instanceof Error) &&
+        validationProvidersResponse.data &&
+        !isModelValid(
+          {
+            providerID: modelField.providerID,
+            modelID: modelField.modelID,
+          },
+          validationProvidersResponse.data.connected,
+          validationProvidersResponse.data.all,
+        )
+      ) {
+        await cleanupOnError(
+          `Model \`${modelField.providerID}/${modelField.modelID}\` is no longer available. Run \`/model\` to pick a different one.`,
+        )
+        return
+      }
 
       const request = {
         sessionID: session.id,
