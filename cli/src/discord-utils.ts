@@ -17,7 +17,7 @@ import type {
   ThreadChannel,
 } from 'discord.js'
 const { ChannelType, GuildMember, MessageFlags, PermissionsBitField, REST, Routes } = discord
-import type { OpencodeClient, Session } from '@opencode-ai/sdk/v2'
+import type { OpencodeClient } from '@opencode-ai/sdk/v2'
 import { discordApiUrl } from './discord-urls.js'
 import { Lexer } from 'marked'
 import { splitTablesFromMarkdown } from './format-tables.js'
@@ -253,8 +253,8 @@ export async function archiveOpenCodeSession({
         title: newTitle,
         time: { archived: archivedAt },
       })
-      const refreshed = await client.session.get({ sessionID: sessionId }) as unknown as { data: { data: Session } }
-      if (typeof refreshed.data.data?.time?.archived === 'number') {
+      const refreshed = await client.session.get({ sessionID: sessionId })
+      if (typeof refreshed.data?.time?.archived === 'number') {
         updateError = null
         break
       }

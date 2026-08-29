@@ -43,13 +43,11 @@ function createStubServer(opts: { firstUpdateNoOp?: boolean; alwaysNoOp?: boolea
         const sessionID = decodeURIComponent(getMatch[1]!)
         const archived = storedArchived.get(sessionID)
         sendJson(200, {
-          data: {
-            id: sessionID,
-            title: 'Test Session',
-            time: archived !== undefined
-              ? { archived }
-              : { created: Date.now(), updated: Date.now() },
-          },
+          id: sessionID,
+          title: 'Test Session',
+          time: archived !== undefined
+            ? { created: Date.now(), updated: Date.now(), archived }
+            : { created: Date.now(), updated: Date.now() },
         })
         return
       }
