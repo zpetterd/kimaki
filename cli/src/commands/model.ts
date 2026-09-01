@@ -15,6 +15,7 @@ import {
   setChannelModel,
   setSessionModel,
   setSessionAgent,
+  clearSessionModel,
   getChannelModel,
   getSessionModel,
   getSessionAgent,
@@ -26,7 +27,8 @@ import {
 } from '../database.js'
 import { initializeOpencodeForDirectory } from '../opencode.js'
 import { resolveTextChannel, getKimakiMetadata } from '../discord-utils.js'
-import { getDefaultModel } from '../session-handler/model-utils.js'
+import { getDefaultModel, isModelValid } from '../session-handler/model-utils.js'
+import { OpenCodeSdkError } from '../errors.js'
 import { getRuntime } from '../session-handler/thread-session-runtime.js'
 import { getThinkingValuesForModel } from '../thinking-utils.js'
 import { createLogger, LogPrefix } from '../logger.js'
@@ -141,6 +143,12 @@ export type CurrentModelInfo =
       providerID: string
       modelID: string
     }
+  | {
+      type: 'invalid'
+      model: string
+      providerID: string
+      modelID: string
+    }
   | { type: 'none' }
 
 function parseModelId(
@@ -173,10 +181,46 @@ export async function ensureSessionPreferencesSnapshot({
   modelOverride?: string
   force?: boolean
 }): Promise<void> {
-  const [sessionAgentPreference, sessionModelPreference] = await Promise.all([
+  let [sessionAgentPreference, sessionModelPreference] = await Promise.all([
     getSessionAgent(sessionId),
     getSessionModel(sessionId),
   ])
+
+  // Fetch the live provider list once. Used for two things:
+  // 1. detect a stale session preference and clear it (below)
+  // 2. forward to getCurrentModelInfo during bootstrap so the bootstrap
+  //    result itself isn't a stale row from channel/global
+  let validationConnected: string[] | undefined
+  let validationProviders:
+    | Array<{ id: string; models?: Record<string, unknown> }>
+    | undefined
+  if (!(getClient instanceof Error)) {
+    const providersResult = await getClient()
+      .provider.list({ directory })
+      .catch((e) => new OpenCodeSdkError({ operation: 'provider.list', cause: e }))
+    if (!(providersResult instanceof Error) && providersResult.data) {
+      validationConnected = providersResult.data.connected
+      validationProviders = providersResult.data.all
+
+      // If a stored session model preference is stale, drop it so the
+      // bootstrap path can re-resolve. Without this, an existing session
+      // would keep dispatching with the dead model id forever.
+      if (sessionModelPreference) {
+        const parsed = parseModelId(sessionModelPreference.modelId)
+        if (
+          parsed &&
+          !isModelValid(parsed, validationConnected, validationProviders)
+        ) {
+          await clearSessionModel(sessionId)
+          modelLogger.log(
+            `[MODEL] Cleared stale session model ${sessionModelPreference.modelId} for session ${sessionId}`,
+          )
+          sessionModelPreference = undefined
+        }
+      }
+    }
+  }
+
   const shouldBootstrapSessionPreferences =
     force || (!sessionAgentPreference && !sessionModelPreference)
   if (!shouldBootstrapSessionPreferences) {
@@ -228,8 +272,15 @@ export async function ensureSessionPreferencesSnapshot({
     agentPreference: bootstrappedAgent,
     getClient,
     directory,
+    // Forward the same provider list used for the stale-preference check so
+    // bootstrap never falls back to a still-invalid channel/global row.
+    connected: validationConnected,
+    providers: validationProviders,
   })
-  if (bootstrappedModel.type === 'none') {
+  if (bootstrappedModel.type === 'none' || bootstrappedModel.type === 'invalid') {
+    modelLogger.log(
+      `[MODEL] Bootstrap would write invalid or unknown model for session ${sessionId}; skipping snapshot`,
+    )
     return
   }
 
@@ -289,7 +340,11 @@ export async function copyCurrentSessionModel({
 
 /**
  * Get the current model info for a channel/session, including where it comes from.
- * Priority: session > agent > channel > global > opencode default
+ * Priority: session > agent > channel > global > opencode default.
+ *
+ * If `connected` and `providers` are supplied, stored preferences whose model is
+ * no longer available are surfaced as `{ type: 'invalid', ... }` instead of being
+ * silently returned. Callers can then clean them up or fail loudly.
  */
 export async function getCurrentModelInfo({
   sessionId,
@@ -298,6 +353,8 @@ export async function getCurrentModelInfo({
   agentPreference,
   getClient,
   directory,
+  connected,
+  providers,
 }: {
   sessionId?: string
   channelId?: string
@@ -305,9 +362,28 @@ export async function getCurrentModelInfo({
   agentPreference?: string
   getClient: Awaited<ReturnType<typeof initializeOpencodeForDirectory>>
   directory?: string
+  connected?: string[]
+  providers?: Array<{ id: string; models?: Record<string, unknown> }>
 }): Promise<CurrentModelInfo> {
   if (getClient instanceof Error) {
     return { type: 'none' }
+  }
+
+  const validateAgainstProviders = (model: {
+    providerID: string
+    modelID: string
+    modelString: string
+  }): CurrentModelInfo | undefined => {
+    if (!connected || !providers) return undefined
+    if (isModelValid({ providerID: model.providerID, modelID: model.modelID }, connected, providers)) {
+      return undefined
+    }
+    return {
+      type: 'invalid',
+      model: model.modelString,
+      providerID: model.providerID,
+      modelID: model.modelID,
+    }
   }
 
   // 1. Check session model preference
@@ -316,6 +392,12 @@ export async function getCurrentModelInfo({
     if (sessionPref) {
       const parsed = parseModelId(sessionPref.modelId)
       if (parsed) {
+        const invalid = validateAgainstProviders({
+          providerID: parsed.providerID,
+          modelID: parsed.modelID,
+          modelString: sessionPref.modelId,
+        })
+        if (invalid) return invalid
         return { type: 'session', model: sessionPref.modelId, ...parsed }
       }
     }
@@ -336,6 +418,12 @@ export async function getCurrentModelInfo({
       const agent = agentsResponse.data.find((a) => a.name === effectiveAgent)
       if (agent?.model) {
         const model = `${agent.model.providerID}/${agent.model.modelID}`
+        const invalid = validateAgainstProviders({
+          providerID: agent.model.providerID,
+          modelID: agent.model.modelID,
+          modelString: model,
+        })
+        if (invalid) return invalid
         return {
           type: 'agent',
           model,
@@ -353,6 +441,12 @@ export async function getCurrentModelInfo({
     if (channelPref) {
       const parsed = parseModelId(channelPref.modelId)
       if (parsed) {
+        const invalid = validateAgainstProviders({
+          providerID: parsed.providerID,
+          modelID: parsed.modelID,
+          modelString: channelPref.modelId,
+        })
+        if (invalid) return invalid
         return { type: 'channel', model: channelPref.modelId, ...parsed }
       }
     }
@@ -364,6 +458,12 @@ export async function getCurrentModelInfo({
     if (globalPref) {
       const parsed = parseModelId(globalPref.modelId)
       if (parsed) {
+        const invalid = validateAgainstProviders({
+          providerID: parsed.providerID,
+          modelID: parsed.modelID,
+          modelString: globalPref.modelId,
+        })
+        if (invalid) return invalid
         return { type: 'global', model: globalPref.modelId, ...parsed }
       }
     }
@@ -464,24 +564,27 @@ export async function handleModelCommand({
       })
     }
 
-    // Parallelize: fetch providers, current model info, and variant cascade at the same time.
-    // getCurrentModelInfo does DB lookups first (fast) and only hits provider.list as fallback.
-    const [providersResponse, currentModelInfo, cascadeVariant] =
-      await Promise.all([
-        getClient().provider.list({ directory: projectDirectory }),
-        getCurrentModelInfo({
-          sessionId,
-          channelId: targetChannelId,
-          appId: effectiveAppId,
-          getClient,
-          directory: projectDirectory,
-        }),
-        getVariantCascade({
-          sessionId,
-          channelId: targetChannelId,
-          appId: effectiveAppId,
-        }),
-      ])
+    // Fetch providers first so getCurrentModelInfo can validate stored preferences
+    // against the live provider list (catches stale rows that no longer resolve).
+    const providersResponse = await getClient().provider.list({
+      directory: projectDirectory,
+    })
+    const [currentModelInfo, cascadeVariant] = await Promise.all([
+      getCurrentModelInfo({
+        sessionId,
+        channelId: targetChannelId,
+        appId: effectiveAppId,
+        getClient,
+        directory: projectDirectory,
+        connected: providersResponse.data?.connected,
+        providers: providersResponse.data?.all,
+      }),
+      getVariantCascade({
+        sessionId,
+        channelId: targetChannelId,
+        appId: effectiveAppId,
+      }),
+    ])
 
     if (!providersResponse.data) {
       await interaction.editReply({
@@ -519,6 +622,8 @@ export async function handleModelCommand({
         case 'opencode-recent':
         case 'opencode-provider-default':
           return `**Current (opencode default):** \`${currentModelInfo.model}\``
+        case 'invalid':
+          return `**Current:** \`${currentModelInfo.model}\` ⚠️ unavailable — run /model to pick another`
         case 'none':
           return '**Current:** none'
       }
