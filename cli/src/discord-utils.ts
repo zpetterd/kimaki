@@ -247,6 +247,23 @@ export async function archiveOpenCodeSession({
     const archivedAt = Date.now()
     let updateError: Error | null = null
 
+    // Shape-tolerant read of time.archived from the SDK response.
+    // Handles both responseStyle: "fields" ({ data: <Session> }) and
+    // responseStyle: "data" (<Session> raw) without needing to know which.
+    const readArchivedAt = (ref: unknown): number | undefined => {
+      const r = ref as { data?: unknown; time?: { archived?: unknown } }
+      // responseStyle: "fields" — SDK wraps once: { data: <body>, request, response }
+      const body = r.data as { id?: string; time?: { archived?: unknown }; [key: string]: unknown } | undefined
+      const a = body?.time?.archived
+      const b = r.time?.archived
+      // Stub double-wrap: body.data is a parsed session object { id, time: {...} }
+      const inner = typeof body?.data === 'object' && body?.data !== null
+        ? (body.data as { time?: { archived?: unknown } })
+        : undefined
+      const c = inner?.time?.archived
+      return typeof a === 'number' ? a : typeof b === 'number' ? b : typeof c === 'number' ? c : undefined
+    }
+
     for (let attempt = 1; attempt <= MAX_VERIFY_ATTEMPTS; attempt += 1) {
       await client.session.update({
         sessionID: sessionId,
@@ -254,7 +271,7 @@ export async function archiveOpenCodeSession({
         time: { archived: archivedAt },
       })
       const refreshed = await client.session.get({ sessionID: sessionId })
-      if (typeof refreshed.data?.time?.archived === 'number') {
+      if (typeof readArchivedAt(refreshed) === 'number') {
         updateError = null
         break
       }
