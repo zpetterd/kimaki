@@ -22,7 +22,17 @@ import { buildOpencodeEventLogLine } from '../session-handler/opencode-session-e
 import { createDiscordRest } from '../discord-urls.js'
 import { archiveThread, uploadFilesToDiscord, stripMentions } from '../discord-utils.js'
 import { setDataDir, setProjectsDir, getDataDir, getProjectsDir } from '../config.js'
-import { execAsync, validateWorktreeDirectory } from '../worktrees.js'
+import {
+  deleteThreadWorkspace,
+  getThreadWorktree,
+} from '../database.js'
+import {
+  deleteWorktree,
+  execAsync,
+  isThreadWorktreeMergedAndClean,
+  removeOpencodeWorkspace,
+  validateWorktreeDirectory,
+} from '../worktrees.js'
 import { upgrade, getCurrentVersion } from '../upgrade.js'
 import { getPromptPreview, parseSendAtValue, parseScheduledTaskPayload, serializeScheduledTaskPayload, type ScheduledTaskPayload } from '../task-schedule.js'
 import {
@@ -603,7 +613,11 @@ cli
     'Archive a Discord thread and stop its mapped OpenCode session',
   )
   .option('--session <sessionId>', 'Resolve thread from an OpenCode session ID')
-  .action(async (threadIdArg: string | undefined, options: { session?: string }) => {
+  .option(
+    '--cleanup-worktree',
+    'Also delete the thread\'s git worktree on disk (requires branch to be merged & clean)',
+  )
+  .action(async (threadIdArg: string | undefined, options: { session?: string; cleanupWorktree?: boolean }) => {
     try {
       await initDatabase()
 
@@ -672,6 +686,77 @@ cli
       } else {
         cliLogger.warn(
           `No mapped OpenCode session found for thread ${resolvedThreadId}`,
+        )
+      }
+
+      // --cleanup-worktree: optionally remove the worktree on disk alongside
+      // the archive. Refuses if the branch isn't merged or has uncommitted
+      // changes — we'd rather force the user to merge first than silently
+      // lose work. Falls back to legacy thread_worktrees when no modern
+      // workspace row exists.
+      if (options.cleanupWorktree) {
+        const workspaceInfo = await getThreadWorktreeOrWorkspace(resolvedThreadId)
+        const legacyInfo = workspaceInfo ? undefined : await getThreadWorktree(resolvedThreadId)
+        const unified = workspaceInfo
+          ? workspaceInfo.status === 'ready' && workspaceInfo.workspace_directory
+            ? {
+                directory: workspaceInfo.workspace_directory,
+                projectDirectory: workspaceInfo.project_directory,
+                branch: workspaceInfo.workspace_name,
+                workspaceId: workspaceInfo.workspace_id ?? null,
+                source: 'workspace' as const,
+              }
+            : null
+          : legacyInfo
+            ? legacyInfo.status === 'ready' && legacyInfo.worktree_directory
+              ? {
+                  directory: legacyInfo.worktree_directory,
+                  projectDirectory: legacyInfo.project_directory,
+                  branch: legacyInfo.worktree_name,
+                  workspaceId: null,
+                  source: 'worktree' as const,
+                }
+              : null
+            : null
+
+        if (!unified) {
+          cliLogger.error(
+            `No ready worktree or workspace found for thread ${resolvedThreadId}`,
+          )
+          process.exit(EXIT_NO_RESTART)
+        }
+
+        const safe = await isThreadWorktreeMergedAndClean({
+          worktreeDir: unified.directory,
+          projectDir: unified.projectDirectory,
+        })
+        if (!safe) {
+          cliLogger.error(
+            `Refusing to clean up worktree for thread ${resolvedThreadId}: branch is not merged into default or has uncommitted changes. Merge and clean up first, then retry.`,
+          )
+          process.exit(EXIT_NO_RESTART)
+        }
+
+        const delResult = unified.workspaceId
+          ? await removeOpencodeWorkspace({
+              projectDirectory: unified.projectDirectory,
+              workspaceId: unified.workspaceId,
+              cleanupBranch: true,
+              branchName: unified.branch,
+            })
+          : await deleteWorktree({
+              projectDirectory: unified.projectDirectory,
+              worktreeDirectory: unified.directory,
+              worktreeName: unified.branch,
+            })
+        if (delResult instanceof Error) {
+          cliLogger.error(`Failed to clean up worktree: ${delResult.message}`)
+          process.exit(EXIT_NO_RESTART)
+        }
+
+        await deleteThreadWorkspace(resolvedThreadId)
+        cliLogger.log(
+          `Cleaned up worktree ${unified.branch} for thread ${resolvedThreadId}`,
         )
       }
 

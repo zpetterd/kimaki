@@ -1,7 +1,8 @@
 // Daily async loop that prompts users about old Kimaki threads.
 //
-// For worktree threads:
-//   - Checks if the worktree branch has been merged (0 commits ahead of default branch)
+// For worktree/workspace threads:
+//   - Looks at both thread_workspaces (modern SDK) and thread_worktrees (legacy)
+//   - Checks if the branch has been merged (0 commits ahead of default branch)
 //     and has no uncommitted changes
 //   - If merged and clean: sends a message with "Clean up worktree & archive" / "Dismiss" buttons
 //   - On confirm: removes the worktree on disk and archives the thread
@@ -24,12 +25,18 @@ import fs from 'node:fs'
 import {
   getAllThreadIds,
   getThreadWorktree,
+  getThreadWorkspace,
   getThreadCreatedAt,
   getCleanupPromptedAt,
   setCleanupPromptedAt,
   deleteThreadWorktree,
+  deleteThreadWorkspace,
 } from './database.js'
-import { git, isDirty, getDefaultBranch, deleteWorktree } from './worktrees.js'
+import {
+  deleteWorktree,
+  isThreadWorktreeMergedAndClean,
+  removeOpencodeWorkspace,
+} from './worktrees.js'
 import { registerHtmlAction, pendingHtmlActions } from './html-actions.js'
 import { createLogger, formatErrorWithStack } from './logger.js'
 import { archiveOpenCodeSessionForThread } from './discord-utils.js'
@@ -115,6 +122,21 @@ function hasPendingCleanupAction(threadId: string): boolean {
   return false
 }
 
+// Unified worktree-or-workspace row used by the sweeper. Either table can
+// drive a cleanup prompt — modern SDK workspaces carry a `workspace_id`
+// that selects the SDK removal path; legacy rows fall back to direct git
+// worktree removal.
+type ThreadWorktreeRow = {
+  directory: string | null
+  projectDirectory: string
+  branch: string
+  // null = legacy worktree without an OpenCode workspace_id (use git directly).
+  // string = SDK workspace, must be removed via OpenCode SDK.
+  workspaceId: string | null
+  // 'workspace' or 'worktree' — selects which DB row to delete on confirm.
+  source: 'workspace' | 'worktree'
+}
+
 export async function evaluateThreadForCleanup({
   threadId,
   rest,
@@ -147,10 +169,36 @@ export async function evaluateThreadForCleanup({
     // if we can't fetch, proceed anyway
   }
 
-  const worktree = await getThreadWorktree(threadId)
+  // Check modern workspace table first, fall back to legacy worktrees. Both
+  // tables can be queried because pre-migration threads may still have
+  // legacy rows even when new ones are created in the modern table.
+  const workspace = await getThreadWorkspace(threadId)
+  const worktree = workspace ? undefined : await getThreadWorktree(threadId)
 
-  if (worktree) {
-    await evaluateWorktreeThread({ threadId, worktree, rest })
+  const unified: ThreadWorktreeRow | null = workspace
+    ? workspace.status === 'ready' && workspace.workspace_directory
+      ? {
+          directory: workspace.workspace_directory,
+          projectDirectory: workspace.project_directory,
+          branch: workspace.workspace_name,
+          workspaceId: workspace.workspace_id ?? null,
+          source: 'workspace',
+        }
+      : null
+    : worktree
+      ? worktree.status === 'ready' && worktree.worktree_directory
+        ? {
+            directory: worktree.worktree_directory,
+            projectDirectory: worktree.project_directory,
+            branch: worktree.worktree_name,
+            workspaceId: null,
+            source: 'worktree',
+          }
+        : null
+      : null
+
+  if (unified) {
+    await evaluateWorktreeThread({ threadId, row: unified, rest })
   } else {
     await evaluateNormalThread({ threadId, rest })
   }
@@ -158,24 +206,20 @@ export async function evaluateThreadForCleanup({
 
 async function evaluateWorktreeThread({
   threadId,
-  worktree,
+  row,
   rest,
 }: {
   threadId: string
-  worktree: {
-    worktree_directory: string | null
-    project_directory: string
-    worktree_name: string
-  }
+  row: ThreadWorktreeRow
   rest: REST
 }): Promise<void> {
-  if (!worktree.worktree_directory) return
+  if (!row.directory) return
 
   const createdAt = await getThreadCreatedAt(threadId)
   if (createdAt && Date.now() - createdAt.getTime() < TWO_DAYS_MS) return
 
-  const worktreeDir = worktree.worktree_directory
-  const projectDir = worktree.project_directory
+  const worktreeDir = row.directory
+  const projectDir = row.projectDirectory
 
   let dirExists: boolean
   try {
@@ -185,11 +229,13 @@ async function evaluateWorktreeThread({
     dirExists = false
   }
 
+  // If the directory is already gone, no git check is needed — prompt to
+  // archive the thread only. Otherwise require the branch to be merged &
+  // clean before we'll offer destructive cleanup.
   const isMerged = dirExists
-    ? await isWorktreeMergedAndClean({
+    ? await isThreadWorktreeMergedAndClean({
         worktreeDir,
         projectDir,
-        threadId,
       })
     : true
 
@@ -205,15 +251,24 @@ async function evaluateWorktreeThread({
         components: [],
       })
 
+      let cleanupError: Error | null = null
       if (dirExists) {
-        const delResult = await deleteWorktree({
-          projectDirectory: projectDir,
-          worktreeDirectory: worktreeDir,
-          worktreeName: worktree.worktree_name,
-        })
+        const delResult = row.workspaceId
+          ? await removeOpencodeWorkspace({
+              projectDirectory: projectDir,
+              workspaceId: row.workspaceId,
+              cleanupBranch: true,
+              branchName: row.branch,
+            })
+          : await deleteWorktree({
+              projectDirectory: projectDir,
+              worktreeDirectory: worktreeDir,
+              worktreeName: row.branch,
+            })
         if (delResult instanceof Error) {
+          cleanupError = delResult
           cleanupLogger.error(
-            `Failed to delete worktree ${worktree.worktree_name}: ${delResult.message}`,
+            `Failed to delete ${row.source} ${row.branch}: ${delResult.message}`,
           )
           await interaction.followUp({
             content: `Failed to clean up worktree: ${delResult.message}`,
@@ -223,7 +278,11 @@ async function evaluateWorktreeThread({
         }
       }
 
-      await deleteThreadWorktree(threadId)
+      if (row.source === 'workspace') {
+        await deleteThreadWorkspace(threadId)
+      } else {
+        await deleteThreadWorktree(threadId)
+      }
       await setCleanupPromptedAt(threadId, NEVER_REPROMPT_AT).catch(() => undefined)
 
       try {
@@ -242,7 +301,9 @@ async function evaluateWorktreeThread({
           )
         }
         await interaction.editReply({
-          content: 'Worktree cleaned up and thread archived.',
+          content: cleanupError
+            ? 'Thread archived but worktree cleanup failed.'
+            : 'Worktree cleaned up and thread archived.',
           components: [],
         })
       } catch (archiveError) {
@@ -271,7 +332,7 @@ async function evaluateWorktreeThread({
     },
   })
 
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const row$ = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`html_action:${cleanupActionId}`)
       .setLabel('Clean up worktree & archive')
@@ -288,41 +349,13 @@ async function evaluateWorktreeThread({
         content: dirExists
           ? 'Your worktree changes have been merged into the default branch. Clean up the worktree and archive this thread?'
           : 'The worktree directory for this thread no longer exists. Archive this thread?',
-        components: [row],
+        components: [row$],
       },
     })
-    cleanupLogger.log(`Sent cleanup prompt for worktree thread ${threadId}`)
+    cleanupLogger.log(`Sent cleanup prompt for ${row.source} thread ${threadId}`)
   } catch {
     cleanupLogger.log(`Could not send cleanup prompt for thread ${threadId} (may be archived)`)
   }
-}
-
-async function isWorktreeMergedAndClean({
-  worktreeDir,
-  projectDir,
-  threadId,
-}: {
-  worktreeDir: string
-  projectDir: string
-  threadId: string
-}): Promise<boolean> {
-  const dirty = await isDirty(worktreeDir)
-  if (dirty) return false
-
-  const defaultBranch = await getDefaultBranch(projectDir)
-  const mergeBase = await git(worktreeDir, `merge-base HEAD "${defaultBranch}"`)
-  if (mergeBase instanceof Error) {
-    cleanupLogger.warn(`Cannot check merge status for ${threadId}: ${mergeBase.message}`)
-    return false
-  }
-
-  const commitCountResult = await git(worktreeDir, `rev-list --count "${mergeBase}..HEAD"`)
-  if (commitCountResult instanceof Error) {
-    cleanupLogger.warn(`Cannot check commit count for ${threadId}: ${commitCountResult.message}`)
-    return false
-  }
-
-  return parseInt(commitCountResult, 10) === 0
 }
 
 async function evaluateNormalThread({
@@ -390,7 +423,7 @@ async function evaluateNormalThread({
     },
   })
 
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const row$ = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`html_action:${archiveActionId}`)
       .setLabel('Archive thread')
@@ -406,7 +439,7 @@ async function evaluateNormalThread({
       body: {
         content:
           'This thread has been inactive for over 2 days. Archive it to keep things tidy?\nYou can resume anytime by sending a message here.',
-        components: [row],
+        components: [row$],
       },
     })
     cleanupLogger.log(`Sent archive prompt for inactive thread ${threadId}`)
