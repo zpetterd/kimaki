@@ -57,7 +57,7 @@ function getRecentModelsFromTuiState(): Array<{
 /**
  * Parse a model string in format "provider/model" into providerID and modelID.
  */
-function parseModelString(
+export function parseModelString(
   model: string,
 ): { providerID: string; modelID: string } | undefined {
   const [providerID, ...modelParts] = model.split('/')
@@ -93,7 +93,7 @@ function getModelFromProjectConfig({
 /**
  * Validate that a model is available (provider connected + model exists).
  */
-function isModelValid(
+export function isModelValid(
   model: { providerID: string; modelID: string },
   connected: string[],
   providers: Array<{ id: string; models?: Record<string, unknown> }>,

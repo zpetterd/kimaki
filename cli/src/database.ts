@@ -374,6 +374,11 @@ export async function setChannelModel({
     })
 }
 
+export async function clearChannelModel(channelId: string) {
+  const db = await getDb()
+  await db.delete(schema.channel_models).where(orm.eq(schema.channel_models.channel_id, channelId))
+}
+
 export async function getGlobalModel(appId: string) {
   const db = await getDb()
   const row = await db.query.global_models.findFirst({ where: { app_id: appId } })
@@ -397,6 +402,11 @@ export async function setGlobalModel({
       target: schema.global_models.app_id,
       set: { model_id: modelId, variant: variant ?? null, updated_at: new Date() },
     })
+}
+
+export async function clearGlobalModel(appId: string) {
+  const db = await getDb()
+  await db.delete(schema.global_models).where(orm.eq(schema.global_models.app_id, appId))
 }
 
 export async function getSessionModel(sessionId: string) {

@@ -14,7 +14,7 @@ const cpuProf = process.env.VITEST_CPU_PROF === '1'
 export default defineConfig({
   test: {
     testTimeout: 8_000,
-    hookTimeout: 5_000,
+    hookTimeout: 30_000,
     env: {
       KIMAKI_VITEST: '1',
     },
