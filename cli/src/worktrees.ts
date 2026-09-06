@@ -15,9 +15,11 @@ import {
   setWorktreeReady,
   setWorkspaceReady,
 } from './database.js'
+import { OpenCodeSdkError } from './errors.js'
 import { execAsync } from './exec-async.js'
 import { createWorktreeCore, type WorktreeResult } from './git-worktree-core.js'
 import { createLogger, LogPrefix } from './logger.js'
+import { initializeOpencodeForDirectory } from './opencode.js'
 
 export { execAsync } from './exec-async.js'
 
@@ -706,6 +708,57 @@ export async function deleteWorktree({
   }
 }
 
+/**
+ * Remove a workspace via the OpenCode SDK.
+ *
+ * SDK-created workspaces are tracked in OpenCode's workspace table; calling
+ * `experimental.workspace.remove` keeps OpenCode in sync and triggers its own
+ * git cleanup. Pass `cleanupBranch: true` to also delete the git branch and
+ * prune stale worktree entries on disk — useful after archive flows where
+ * leaving the branch around would clutter the repo.
+ */
+export async function removeOpencodeWorkspace({
+  projectDirectory,
+  workspaceId,
+  cleanupBranch,
+  branchName,
+}: {
+  projectDirectory: string
+  workspaceId: string
+  cleanupBranch?: boolean
+  branchName?: string
+}): Promise<void | Error> {
+  const getClient = await initializeOpencodeForDirectory(projectDirectory)
+  if (getClient instanceof Error) return getClient
+
+  const response = await getClient().experimental.workspace.remove({
+    id: workspaceId,
+    directory: projectDirectory,
+  }).catch((e) => new OpenCodeSdkError({ operation: 'workspace.remove', cause: e }))
+  if (response instanceof Error) return response
+  if (response.error) {
+    return new Error(`Workspace removal failed: ${JSON.stringify(response.error)}`)
+  }
+
+  if (!cleanupBranch) return undefined
+
+  // Best-effort prune: the SDK handles cleanup but may leave a stale entry
+  // in `git worktree list` if the directory was already gone.
+  await git(projectDirectory, 'worktree prune').catch(() => undefined)
+
+  if (branchName) {
+    const deleteBranchResult = await git(
+      projectDirectory,
+      `branch -d ${JSON.stringify(branchName)}`,
+    )
+    if (deleteBranchResult instanceof Error) {
+      return new Error(`Failed to delete branch ${branchName}`, {
+        cause: deleteBranchResult,
+      })
+    }
+  }
+}
+
 export async function isDirty(
   dir: string,
   opts?: { timeout?: number },
@@ -714,6 +767,39 @@ export async function isDirty(
   if (status instanceof Error) return false
   return status.length > 0
 }
+
+/**
+ * Check whether a thread's git worktree/workspace branch is merged into the
+ * project's default branch and has no uncommitted changes. Used by archive and
+ * cleanup flows to decide if it's safe to delete the worktree on disk.
+ *
+ * `directory` may be a workspace directory (modern SDK workspaces live under
+ * `~/.kimaki/worktrees/<id>/<name>`), a legacy thread_worktrees directory, or
+ * any path that has its own git working tree.
+ *
+ * Returns `false` on any git error so the caller falls back to a safer
+ * "don't delete" path.
+ */
+export async function isThreadWorktreeMergedAndClean({
+  worktreeDir,
+  projectDir,
+}: {
+  worktreeDir: string
+  projectDir: string
+}): Promise<boolean> {
+  const dirty = await isDirty(worktreeDir)
+  if (dirty) return false
+
+  const defaultBranch = await getDefaultBranch(projectDir)
+  const mergeBase = await git(worktreeDir, `merge-base HEAD "${defaultBranch}"`)
+  if (mergeBase instanceof Error) return false
+
+  const commitCountResult = await git(worktreeDir, `rev-list --count "${mergeBase}..HEAD"`)
+  if (commitCountResult instanceof Error) return false
+
+  return parseInt(commitCountResult, 10) === 0
+}
+
 
 export async function isGitRepositoryRoot(directory: string): Promise<boolean> {
   const topLevel = await git(directory, 'rev-parse --show-toplevel')

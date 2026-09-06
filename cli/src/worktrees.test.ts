@@ -11,6 +11,7 @@ import {
   createWorktreeWithSubmodules,
   execAsync,
   getManagedWorktreeDirectory,
+  isThreadWorktreeMergedAndClean,
   mergeWorktree,
   parseGitmodulesFileContent,
   parseGitWorktreeListPorcelain,
@@ -1001,6 +1002,119 @@ describe('recoverWorktreeDirectory migrates old-format worktrees', () => {
       // DB should be updated with new path
       const updatedWorkspace = await getThreadWorkspace(testThreadId)
       expect(updatedWorkspace?.workspace_directory).toBe(result.worktreeDirectory)
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('isThreadWorktreeMergedAndClean', () => {
+  test('returns true when branch is merged into default and working tree is clean', async () => {
+    const sandbox = createTestRoot()
+    try {
+      await git({ cwd: sandbox, args: ['init', '-b', 'main'] })
+      await git({ cwd: sandbox, args: ['config', 'user.email', 'test@test.com'] })
+      await git({ cwd: sandbox, args: ['config', 'user.name', 'Test'] })
+      fs.writeFileSync(path.join(sandbox, 'readme.md'), 'project')
+      await git({ cwd: sandbox, args: ['add', '.'] })
+      await git({ cwd: sandbox, args: ['commit', '-m', 'init'] })
+
+      const worktreeDir = path.join(sandbox, 'wt-merged')
+      await git({
+        cwd: sandbox,
+        args: ['worktree', 'add', '-b', 'feature', worktreeDir],
+      })
+      // Add a commit on the feature branch, then merge it back to main.
+      fs.writeFileSync(path.join(worktreeDir, 'feature.md'), 'feature')
+      await git({ cwd: worktreeDir, args: ['add', '.'] })
+      await git({ cwd: worktreeDir, args: ['commit', '-m', 'feature work'] })
+      await git({
+        cwd: sandbox,
+        args: ['merge', '--no-ff', 'feature', '-m', 'merge feature'],
+      })
+
+      const result = await isThreadWorktreeMergedAndClean({
+        worktreeDir,
+        projectDir: sandbox,
+      })
+      expect(result).toBe(true)
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true })
+    }
+  })
+
+  test('returns false when branch has commits ahead of default branch', async () => {
+    const sandbox = createTestRoot()
+    try {
+      await git({ cwd: sandbox, args: ['init', '-b', 'main'] })
+      await git({ cwd: sandbox, args: ['config', 'user.email', 'test@test.com'] })
+      await git({ cwd: sandbox, args: ['config', 'user.name', 'Test'] })
+      fs.writeFileSync(path.join(sandbox, 'readme.md'), 'project')
+      await git({ cwd: sandbox, args: ['add', '.'] })
+      await git({ cwd: sandbox, args: ['commit', '-m', 'init'] })
+
+      const worktreeDir = path.join(sandbox, 'wt-unmerged')
+      await git({
+        cwd: sandbox,
+        args: ['worktree', 'add', '-b', 'feature', worktreeDir],
+      })
+      fs.writeFileSync(path.join(worktreeDir, 'feature.md'), 'feature')
+      await git({ cwd: worktreeDir, args: ['add', '.'] })
+      await git({ cwd: worktreeDir, args: ['commit', '-m', 'feature work'] })
+
+      const result = await isThreadWorktreeMergedAndClean({
+        worktreeDir,
+        projectDir: sandbox,
+      })
+      expect(result).toBe(false)
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true })
+    }
+  })
+
+  test('returns false when working tree has uncommitted changes', async () => {
+    const sandbox = createTestRoot()
+    try {
+      await git({ cwd: sandbox, args: ['init', '-b', 'main'] })
+      await git({ cwd: sandbox, args: ['config', 'user.email', 'test@test.com'] })
+      await git({ cwd: sandbox, args: ['config', 'user.name', 'Test'] })
+      fs.writeFileSync(path.join(sandbox, 'readme.md'), 'project')
+      await git({ cwd: sandbox, args: ['add', '.'] })
+      await git({ cwd: sandbox, args: ['commit', '-m', 'init'] })
+
+      const worktreeDir = path.join(sandbox, 'wt-dirty')
+      await git({
+        cwd: sandbox,
+        args: ['worktree', 'add', '-b', 'feature', worktreeDir],
+      })
+      // Make it dirty without committing.
+      fs.writeFileSync(path.join(worktreeDir, 'untracked.md'), 'dirty')
+
+      const result = await isThreadWorktreeMergedAndClean({
+        worktreeDir,
+        projectDir: sandbox,
+      })
+      expect(result).toBe(false)
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true })
+    }
+  })
+
+  test('returns false when worktree directory is gone', async () => {
+    const sandbox = createTestRoot()
+    try {
+      await git({ cwd: sandbox, args: ['init', '-b', 'main'] })
+      await git({ cwd: sandbox, args: ['config', 'user.email', 'test@test.com'] })
+      await git({ cwd: sandbox, args: ['config', 'user.name', 'Test'] })
+      fs.writeFileSync(path.join(sandbox, 'readme.md'), 'project')
+      await git({ cwd: sandbox, args: ['add', '.'] })
+      await git({ cwd: sandbox, args: ['commit', '-m', 'init'] })
+
+      const result = await isThreadWorktreeMergedAndClean({
+        worktreeDir: path.join(sandbox, 'does-not-exist'),
+        projectDir: sandbox,
+      })
+      expect(result).toBe(false)
     } finally {
       fs.rmSync(sandbox, { recursive: true, force: true })
     }

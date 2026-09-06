@@ -28,14 +28,14 @@ import {
 } from '../html-actions.js'
 import * as errore from 'errore'
 import crypto from 'node:crypto'
-import { GitCommandError, OpenCodeSdkError } from '../errors.js'
+import { GitCommandError } from '../errors.js'
 import { resolveWorkingDirectory } from '../discord-utils.js'
-import { initializeOpencodeForDirectory } from '../opencode.js'
 import {
   deleteWorktree,
   git,
   getDefaultBranch,
   listGitWorktrees,
+  removeOpencodeWorkspace,
   type GitWorktree,
 } from '../worktrees.js'
 import path from 'node:path'
@@ -557,7 +557,10 @@ async function handleDeleteWorktreeAction({
   // still use the direct git cleanup path.
   const displayName = row.branch ?? row.name
   const deleteResult = row.workspaceId
-    ? await deleteWorkspace({ projectDirectory, workspaceId: row.workspaceId })
+    ? await removeOpencodeWorkspace({
+        projectDirectory,
+        workspaceId: row.workspaceId,
+      })
     : await deleteWorktree({
         projectDirectory,
         worktreeDirectory: row.directory,
@@ -593,24 +596,6 @@ async function handleDeleteWorktreeAction({
       return interaction.editReply(options)
     },
   })
-}
-
-async function deleteWorkspace({
-  projectDirectory,
-  workspaceId,
-}: {
-  projectDirectory: string
-  workspaceId: string
-}) {
-  const getClient = await initializeOpencodeForDirectory(projectDirectory)
-  if (getClient instanceof Error) return getClient
-
-  const response = await getClient().experimental.workspace.remove({
-    id: workspaceId,
-    directory: projectDirectory,
-  }).catch((e) => new OpenCodeSdkError({ operation: 'workspace.remove', cause: e }))
-  if (response instanceof Error) return response
-  if (response.error) return new Error(`Workspace removal failed: ${JSON.stringify(response.error)}`)
 }
 
 export async function handleWorktreesCommand({
